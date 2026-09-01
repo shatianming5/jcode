@@ -74,17 +74,14 @@
   than claimed as a CLI E2E.
 - No orphan `copilot --acp --stdio` process remained after smoke shutdown.
 - Installed atomically at
-  `~/.jcode/builds/versions/0.81.9-dev-c091fff9d/jcode`; `current`,
+  `~/.jcode/builds/versions/0.81.11-dev-32de5fc55/jcode`; `current`,
   `shared-server`, and `~/.local/bin/jcode` resolve to it. The v0.81.4 binary
-  and previous `0.81.7-dev-5067d2f5a` dev build remain available for rollback.
-- Fresh login shell reports `jcode v0.81.9-dev (c091fff9d)`.
+  and previous `0.81.9-dev-c091fff9d` dev build remain available for rollback.
+- Fresh login shell reports `jcode v0.81.11-dev (32de5fc55)`.
 - `verify.sh --scan .` still reports the repository's pre-existing fake
   long-form credential fixtures; the change diff contains no credential value.
 
 ## Next
 
-- Push the final-review commit, refresh draft PR #1, rebuild from the clean
-  commit, and atomically promote the next dev version while retaining rollback
-  builds.
-- Upstream draft PR creation previously returned the known
-  `CreatePullRequest`/404 permission blocker; do not retry it indefinitely.
+- Refresh draft PR #1 with final-review evidence. Upstream PR creation remains
+  unnecessary after the known `CreatePullRequest`/404 permission blocker.
