@@ -48,16 +48,17 @@
   is covered by the fake ACP integration and two-Agent isolation tests rather
   than claimed as a CLI E2E.
 - No orphan `copilot --acp --stdio` process remained after smoke shutdown.
-- Installed at
-  `~/.jcode/builds/versions/0.81.7-dev-5067d2f5a/jcode`; stable and
-  `~/.local/bin/jcode` resolve to that binary, with v0.81.4 retained.
+- Installed atomically at
+  `~/.jcode/builds/versions/0.81.9-dev-c091fff9d/jcode`; `current`,
+  `shared-server`, and `~/.local/bin/jcode` resolve to it. The v0.81.4 binary
+  and previous `0.81.7-dev-5067d2f5a` dev build remain available for rollback.
+- Fresh login shell reports `jcode v0.81.9-dev (c091fff9d)`.
 - `verify.sh --scan .` still reports the repository's pre-existing fake
   long-form credential fixtures; the change diff contains no credential value.
 
 ## Next
 
-- Commit/push the reviewed repair, update the draft-PR status if permitted, then
-  atomically install the accepted dev binary while retaining v0.81.4 and the
-  previous dev version.
+- Push the final empty-tool/installation evidence commit and refresh draft PR
+  `shatianming5/jcode#1`.
 - Upstream draft PR creation previously returned the known
   `CreatePullRequest`/404 permission blocker; do not retry it indefinitely.
