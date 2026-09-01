@@ -59,6 +59,14 @@
   pending/in-progress and then completed. Completed-only, failed, incomplete,
   and execute-kind fixtures are rejected; the real read-only `Cargo.toml` smoke
   passes this lifecycle check.
+- Final auth-test cleanup buffers text across chunks and removes only complete,
+  exact configuration-notice lines. A retained `ERROR` before `AUTH_TEST_OK`
+  fails strict output validation, while split notification/marker chunks and
+  legitimate `Info:` text preserve order and content.
+- Provider-tool validation now enforces monotonic per-ID transitions:
+  Pending→Completed and InProgress→Completed pass; Completed-only,
+  Pending→Completed→InProgress, failed, incomplete, and wrong-kind sequences
+  fail. Completed must be the final observed state.
 - `cargo test -p jcode-provider-copilot-runtime --test official_cli` now passes
   15 tests; fork settings and per-fork first-turn tests pass; full
   `cargo check -p jcode --no-default-features` passes.

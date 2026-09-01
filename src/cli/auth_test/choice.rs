@@ -348,14 +348,12 @@ async fn run_internal_provider_tool_smoke(
         .complete_split_with_context(&messages, &tools, "", "", None, &request_context)
         .await
         .context("Internal provider tool smoke failed to open a response stream")?;
-    let mut output = String::new();
+    let mut text_cleaner = AuthTestTextCleaner::default();
     let mut tool_updates = Vec::new();
     while let Some(event) = stream.next().await {
         match event? {
             crate::message::StreamEvent::TextDelta(text) => {
-                if let Some(text) = auth_test_assistant_text_fragment(&text) {
-                    output.push_str(text);
-                }
+                text_cleaner.push_chunk(&text);
             }
             crate::message::StreamEvent::ProviderToolUpdate {
                 id, kind, status, ..
@@ -365,6 +363,7 @@ async fn run_internal_provider_tool_smoke(
             _ => {}
         }
     }
+    let output = text_cleaner.finish();
     validate_internal_provider_tool_smoke(&tool_updates, &output)?;
     Ok(output.trim().to_string())
 }
@@ -376,21 +375,64 @@ struct InternalToolUpdate {
     status: Option<crate::message::ProviderToolStatus>,
 }
 
-fn auth_test_assistant_text_fragment(text: &str) -> Option<&str> {
-    const PREFIXES: [&str; 3] = [
-        "Info: Disabled tools: ",
-        "Info: Unknown tool name in the tool allowlist: ",
-        "Info: Unknown tool name in the tool excludedlist: ",
-    ];
-    if !PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
-        return Some(text);
+#[derive(Default)]
+struct AuthTestTextCleaner {
+    pending: String,
+    output: String,
+}
+
+impl AuthTestTextCleaner {
+    fn push_chunk(&mut self, text: &str) {
+        if self.pending.is_empty()
+            && !text.contains('\n')
+            && is_exact_auth_test_configuration_line(text)
+        {
+            return;
+        }
+        self.pending.push_str(text);
+        while let Some(newline) = self.pending.find('\n') {
+            let line = self.pending[..newline].to_string();
+            self.pending.drain(..=newline);
+            if !is_exact_auth_test_configuration_line(&line) {
+                self.output.push_str(&line);
+                self.output.push('\n');
+            }
+        }
     }
-    if let Some(marker) = text.find("AUTH_TEST_OK") {
-        return Some(&text[marker..]);
+
+    fn finish(mut self) -> String {
+        if !self.pending.is_empty() && !is_exact_auth_test_configuration_line(&self.pending) {
+            self.output.push_str(&self.pending);
+        }
+        self.output
     }
-    text.find('\n')
-        .map(|newline| text[newline + 1..].trim_start())
-        .filter(|body| !body.is_empty())
+}
+
+fn is_exact_auth_test_configuration_line(line: &str) -> bool {
+    if let Some(tools) = line.strip_prefix("Info: Disabled tools: ") {
+        let tools = tools.split(", ").collect::<Vec<_>>();
+        return !tools.is_empty()
+            && tools.iter().all(|tool| {
+                !tool.is_empty()
+                    && tool
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character))
+            })
+            && (tools.len() > 1
+                || matches!(
+                    tools[0],
+                    "bash" | "create" | "edit" | "glob" | "grep" | "view" | "web_fetch"
+                ));
+    }
+    for prefix in [
+        "Info: Unknown tool name in the tool allowlist: \"",
+        "Info: Unknown tool name in the tool excludedlist: \"",
+    ] {
+        if let Some(name) = line.strip_prefix(prefix).and_then(|line| line.strip_suffix('"')) {
+            return !name.is_empty() && !name.contains('"');
+        }
+    }
+    false
 }
 
 fn validate_internal_provider_tool_smoke(
@@ -415,10 +457,19 @@ fn validate_internal_provider_tool_smoke(
     }
     let id = ids.into_iter().next().unwrap_or_default();
     let mut kind = None;
-    let mut saw_started = false;
-    let mut completed_after_start = false;
-    let mut failed = false;
+    let mut current_status = None;
     for update in updates.iter().filter(|update| update.id == id) {
+        if matches!(
+            current_status,
+            Some(
+                crate::message::ProviderToolStatus::Completed
+                    | crate::message::ProviderToolStatus::Failed
+            )
+        ) {
+            anyhow::bail!(
+                "internal tool smoke ACP tool {id} received an update after terminal state {current_status:?}"
+            );
+        }
         if let Some(update_kind) = update.kind {
             if let Some(existing) = kind
                 && existing != update_kind
@@ -429,17 +480,40 @@ fn validate_internal_provider_tool_smoke(
             }
             kind = Some(update_kind);
         }
-        match update.status {
-            Some(
+        let Some(next_status) = update.status else {
+            continue;
+        };
+        let valid = match current_status {
+            None => matches!(
+                next_status,
                 crate::message::ProviderToolStatus::Pending
-                | crate::message::ProviderToolStatus::InProgress,
-            ) => saw_started = true,
-            Some(crate::message::ProviderToolStatus::Completed) if saw_started => {
-                completed_after_start = true;
-            }
-            Some(crate::message::ProviderToolStatus::Failed) => failed = true,
-            _ => {}
+                    | crate::message::ProviderToolStatus::InProgress
+            ),
+            Some(crate::message::ProviderToolStatus::Pending) => matches!(
+                next_status,
+                crate::message::ProviderToolStatus::Pending
+                    | crate::message::ProviderToolStatus::InProgress
+                    | crate::message::ProviderToolStatus::Completed
+                    | crate::message::ProviderToolStatus::Failed
+            ),
+            Some(crate::message::ProviderToolStatus::InProgress) => matches!(
+                next_status,
+                crate::message::ProviderToolStatus::InProgress
+                    | crate::message::ProviderToolStatus::Completed
+                    | crate::message::ProviderToolStatus::Failed
+            ),
+            Some(
+                crate::message::ProviderToolStatus::Completed
+                | crate::message::ProviderToolStatus::Failed
+                | crate::message::ProviderToolStatus::Other,
+            ) => false,
+        };
+        if !valid {
+            anyhow::bail!(
+                "internal tool smoke ACP tool {id} made invalid status transition {current_status:?} -> {next_status:?}"
+            );
         }
+        current_status = Some(next_status);
     }
     if !matches!(
         kind,
@@ -449,14 +523,13 @@ fn validate_internal_provider_tool_smoke(
     ) {
         anyhow::bail!("internal tool smoke used non-read-only ACP tool kind {kind:?}");
     }
-    if failed {
+    if current_status == Some(crate::message::ProviderToolStatus::Failed) {
         anyhow::bail!("internal tool smoke ACP tool {id} failed");
     }
-    if !saw_started {
-        anyhow::bail!("internal tool smoke ACP tool {id} never entered pending/in-progress state");
-    }
-    if !completed_after_start {
-        anyhow::bail!("internal tool smoke ACP tool {id} did not complete after starting");
+    if current_status != Some(crate::message::ProviderToolStatus::Completed) {
+        anyhow::bail!(
+            "internal tool smoke ACP tool {id} did not finish in completed state (final={current_status:?})"
+        );
     }
     Ok(())
 }
@@ -757,23 +830,56 @@ mod auth_tool_smoke_tests {
         }
     }
 
+    fn clean_auth_test_chunks(chunks: &[&str]) -> String {
+        let mut cleaner = AuthTestTextCleaner::default();
+        for chunk in chunks {
+            cleaner.push_chunk(chunk);
+        }
+        cleaner.finish()
+    }
+
     #[test]
-    fn auth_test_configuration_info_strips_only_the_notification_fragment() {
+    fn auth_test_configuration_cleaner_preserves_errors_in_original_order() {
+        let output = clean_auth_test_chunks(&[
+            "Info: Disabled tools: bash, edit\nERROR\nAUTH_TEST_OK",
+        ]);
+        assert_eq!(output, "ERROR\nAUTH_TEST_OK");
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            &output,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ERROR"), "{error}");
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_handles_notification_and_marker_chunks() {
         assert_eq!(
-            auth_test_assistant_text_fragment("Info: Disabled tools: bash, edit"),
-            None
+            clean_auth_test_chunks(&["Info: Disabled tools: bash, edit", "AUTH_TEST_OK"]),
+            "AUTH_TEST_OK"
         );
         assert_eq!(
-            auth_test_assistant_text_fragment(
-                "Info: Disabled tools: bash, edit\nAUTH_TEST_OK"
-            ),
-            Some("AUTH_TEST_OK")
+            clean_auth_test_chunks(&[
+                "Info: Disabled ",
+                "tools: bash, edit\n",
+                "AUTH_TEST_OK"
+            ]),
+            "AUTH_TEST_OK"
         );
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_preserves_legitimate_info_prefix() {
         assert_eq!(
-            auth_test_assistant_text_fragment(
-                "Info: Disabled tools: bash, editAUTH_TEST_OK"
-            ),
-            Some("AUTH_TEST_OK")
+            clean_auth_test_chunks(&["Info: Disabled tools: legitimate"]),
+            "Info: Disabled tools: legitimate"
         );
     }
 
@@ -790,6 +896,21 @@ mod auth_tool_smoke_tests {
             "AUTH_TEST_OK",
         )
         .expect("completed read-only internal tool");
+    }
+
+    #[test]
+    fn internal_tool_smoke_accepts_in_progress_read_only_tool_that_completes() {
+        validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::InProgress),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .expect("in-progress read-only internal tool");
     }
 
     #[test]
@@ -820,7 +941,39 @@ mod auth_tool_smoke_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("did not complete"), "{error}");
+        assert!(error.contains("did not finish in completed state"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_completed_only_update() {
+        let error = validate_internal_provider_tool_smoke(
+            &[internal_update(
+                Some(crate::message::ProviderToolKind::Read),
+                Some(crate::message::ProviderToolStatus::Completed),
+            )],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid status transition"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_update_after_completed() {
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+                internal_update(None, Some(crate::message::ProviderToolStatus::InProgress)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("update after terminal state"), "{error}");
     }
 
     #[test]
