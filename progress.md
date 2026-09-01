@@ -16,15 +16,40 @@
   session ID; opaque ACP sessions reject rewind before local history changes.
 - Auth-test uses an ACP capability handshake in official mode, and usage reports
   remote quota as CLI-managed/unsupported without loading native credentials.
+- Final review fixes make `MultiProvider::fork` call the Copilot runtime's own
+  fork so model state stays session-local, validate official internal tool smoke
+  from ACP status plus exact final text, and reject `auth-test --login` before
+  Jcode's native device/token flow.
 
 ## Evidence
 
 - Red-before-fix:
   `view_only_profile_rejects_execute_permission_by_kind` selected AllowOnce on
   the old implementation.
+- Red-before-final-fix:
+  `copilot_forks_do_not_share_mutable_model_state` showed an A-side model switch
+  changing B from `claude-sonnet-4.6` to `gpt-5-mini`.
 - `cargo test -p jcode-provider-copilot --lib`
 - `cargo test -p jcode-provider-copilot-runtime --lib`
-- `cargo test -p jcode-provider-copilot-runtime --test official_cli` (13 passed)
+- `cargo test -p jcode-provider-copilot-runtime --test official_cli` (14 passed,
+  including real `MultiProvider`/fake-ACP dual-Agent resume isolation)
+- `cargo test -p jcode-base --no-default-features
+  copilot_forks_do_not_share_mutable_model_state`
+- `cargo test -p jcode-provider-copilot-runtime --lib
+  native_copilot_fork_keeps_model_state_session_local`
+- Official auth-test command fixtures: full default smoke passes with exact
+  `AUTH_TEST_OK` and ACP internal read-only tool status; official `--login`
+  refuses before its login-runner spy and leaves no pending/token file; native
+  `--login` still invokes the existing runner.
+- Real new-login-shell `jcode auth-test --provider copilot` completed provider
+  smoke and read-only ACP-internal tool smoke with exact `AUTH_TEST_OK` outputs
+  and exit 0.
+- Real official `auth-test --login` returned the CLI-managed-auth refusal before
+  any native login flow; isolated pending-login and saved-token paths remained
+  absent.
+- Official CLI `Info: Disabled tools: ...` configuration notifications are
+  filtered from assistant text; the real full auth-test no longer sees status
+  text concatenated with its final marker.
 - `cargo test -p jcode-app-core --no-default-features provider_session_tests`
 - `cargo test -p jcode-base --no-default-features
   official_copilot_usage_is_cli_managed_without_native_credentials`
@@ -58,7 +83,8 @@
 
 ## Next
 
-- Push the final empty-tool/installation evidence commit and refresh draft PR
-  `shatianming5/jcode#1`.
+- Push the final-review commit, refresh draft PR #1, rebuild from the clean
+  commit, and atomically promote the next dev version while retaining rollback
+  builds.
 - Upstream draft PR creation previously returned the known
   `CreatePullRequest`/404 permission blocker; do not retry it indefinitely.

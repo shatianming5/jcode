@@ -1,10 +1,13 @@
 use futures::StreamExt;
+use jcode_app_core::{agent::Agent, session::Session, tool::Registry};
+use jcode_base::provider::{MultiProvider, external};
 use jcode_message_types::{Message, StreamEvent, ToolDefinition};
 use jcode_provider_copilot_runtime::{CopilotApiProvider, CopilotOfficialCliProcess};
 use jcode_provider_core::{Provider, ProviderRequestContext};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 fn fake_process(log: &Path) -> CopilotOfficialCliProcess {
     let mut env = BTreeMap::new();
@@ -549,6 +552,91 @@ async fn established_session_continues_after_model_switch_via_load_and_set_model
         requests.contains("\"modelId\":\"gpt-5-mini\""),
         "{requests}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multiprovider_forks_isolate_two_agents_and_resumed_acp_model_state() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let saved = [
+        (
+            "JCODE_COPILOT_TRANSPORT",
+            std::env::var("JCODE_COPILOT_TRANSPORT").ok(),
+        ),
+        (
+            "JCODE_COPILOT_CLI_PATH",
+            std::env::var("JCODE_COPILOT_CLI_PATH").ok(),
+        ),
+        ("JCODE_HOME", std::env::var("JCODE_HOME").ok()),
+        (
+            "JCODE_ACTIVE_PROVIDER",
+            std::env::var("JCODE_ACTIVE_PROVIDER").ok(),
+        ),
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let working_dir = temp.path().join("agent-workdir");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    let log = temp.path().join("multiprovider-forks.jsonl");
+    let process = fake_process(&log);
+    external::register_external_provider(external::COPILOT_RUNTIME, move || {
+        let provider = CopilotApiProvider::with_official_process(process.clone());
+        provider.complete_init_without_tier_detection();
+        Arc::new(provider) as Arc<dyn Provider>
+    });
+    unsafe {
+        std::env::set_var("JCODE_COPILOT_TRANSPORT", "official-cli");
+        std::env::set_var(
+            "JCODE_COPILOT_CLI_PATH",
+            env!("CARGO_BIN_EXE_jcode-fake-copilot-acp"),
+        );
+        std::env::set_var("JCODE_HOME", temp.path().join("jcode-home"));
+        std::env::set_var("JCODE_ACTIVE_PROVIDER", "copilot");
+    }
+
+    let template = MultiProvider::new_fast();
+    template
+        .set_model("copilot:claude-sonnet-4.6")
+        .expect("select initial Copilot model");
+    let first_provider = template.fork();
+    let second_provider = template.fork();
+    let first_registry = Registry::new(Arc::clone(&first_provider)).await;
+    let second_registry = Registry::new(Arc::clone(&second_provider)).await;
+    let mut first_session = Session::create_with_id("agent-a".to_string(), None, None);
+    first_session.model = Some("claude-sonnet-4.6".to_string());
+    first_session.working_dir = Some(working_dir.display().to_string());
+    let mut second_session = Session::create_with_id("agent-b".to_string(), None, None);
+    second_session.model = Some("claude-sonnet-4.6".to_string());
+    second_session.working_dir = Some(working_dir.display().to_string());
+    let mut first = Agent::new_with_session(first_provider, first_registry, first_session, None);
+    let mut second =
+        Agent::new_with_session(second_provider, second_registry, second_session, None);
+
+    second.run_once_capture("first B turn").await.unwrap();
+    first.set_model("copilot:gpt-5-mini").unwrap();
+    assert_eq!(first.provider_model(), "gpt-5-mini");
+    assert_eq!(second.provider_model(), "claude-sonnet-4.6");
+    assert_eq!(
+        template.fork().model(),
+        "claude-sonnet-4.6",
+        "the same fork seam used by headless/restored sessions must remain isolated"
+    );
+    second.run_once_capture("second B turn").await.unwrap();
+
+    let requests = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(requests.matches("\"method\":\"session/new\"").count(), 1);
+    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 1);
+    assert!(
+        !requests.contains("\"method\":\"session/set_model\""),
+        "agent B inherited agent A's model switch: {requests}"
+    );
+
+    unsafe {
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

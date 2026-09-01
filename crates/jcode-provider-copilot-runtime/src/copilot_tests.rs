@@ -35,6 +35,19 @@ fn native_transport_regression_and_construction_lock() {
 }
 
 #[test]
+fn native_copilot_fork_keeps_model_state_session_local() {
+    let provider = make_test_provider(Vec::new());
+    provider.set_model("claude-sonnet-4.6").unwrap();
+    let forked = provider.fork();
+
+    forked.set_model("gpt-5-mini").unwrap();
+
+    assert_eq!(forked.model(), "gpt-5-mini");
+    assert_eq!(provider.model(), "claude-sonnet-4.6");
+    assert_eq!(forked.transport().as_deref(), Some("native"));
+}
+
+#[test]
 fn official_transport_reports_internal_tool_handling() {
     let provider = CopilotApiProvider::with_official_process(
         CopilotOfficialCliProcess::with_command(PathBuf::from("copilot")),
@@ -43,6 +56,19 @@ fn official_transport_reports_internal_tool_handling() {
     assert!(provider.handles_tools_internally());
     assert!(!provider.supports_compaction());
     assert!(provider.set_reasoning_effort("high").is_err());
+}
+
+#[test]
+fn official_cli_configuration_info_is_not_assistant_text() {
+    assert!(is_official_cli_configuration_info(
+        "Info: Disabled tools: bash, edit"
+    ));
+    assert!(is_official_cli_configuration_info(
+        "Info: Unknown tool name in the tool allowlist: \"missing\""
+    ));
+    assert!(!is_official_cli_configuration_info(
+        "Informational assistant response"
+    ));
 }
 
 #[test]

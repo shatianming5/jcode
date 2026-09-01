@@ -32,7 +32,8 @@ async fn maybe_run_auth_test_smoke(
                     kind.step_name(),
                     ok,
                     if ok {
-                        kind.success_detail().to_string()
+                        kind.success_detail_for_choice(&target.provider_choice())
+                            .to_string()
                     } else {
                         kind.failure_detail(&output)
                     },
@@ -77,7 +78,7 @@ async fn maybe_run_auth_test_smoke_for_choice(
                             kind.step_name(),
                             ok,
                             if ok {
-                                kind.success_detail().to_string()
+                                kind.success_detail_for_choice(choice).to_string()
                             } else {
                                 kind.failure_detail(&output)
                             },
@@ -567,16 +568,10 @@ async fn run_auth_test_target(
     let mut report = AuthTestProviderReport::new(target);
 
     if login {
-        match super::login::run_login(
-            &target.provider_choice(),
-            None,
-            super::login::LoginOptions::default(),
-        )
-        .await
-        {
-            Ok(()) => report.push_step("login", true, "Login flow completed."),
-            Err(err) => report.push_step("login", false, err.to_string()),
-        }
+        run_auth_test_login_with(target, &mut report, |choice| async move {
+            super::login::run_login(&choice, None, super::login::LoginOptions::default()).await
+        })
+        .await;
     }
 
     populate_auth_test_target_report(
@@ -589,6 +584,31 @@ async fn run_auth_test_target(
         report,
     )
     .await
+}
+
+async fn run_auth_test_login_with<F, Fut>(
+    target: AuthTestTarget,
+    report: &mut AuthTestProviderReport,
+    run_login: F,
+) where
+    F: FnOnce(super::provider_init::ProviderChoice) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if matches!(target, AuthTestTarget::Copilot)
+        && crate::provider::copilot::official_cli_selected()
+    {
+        report.push_step(
+            "login",
+            false,
+            "Official Copilot CLI manages authentication. `jcode auth-test --login --provider copilot` will not start or persist Jcode's native device flow; authenticate with the official `copilot login` command, then rerun auth-test without --login.",
+        );
+        return;
+    }
+
+    match run_login(target.provider_choice()).await {
+        Ok(()) => report.push_step("login", true, "Login flow completed."),
+        Err(err) => report.push_step("login", false, err.to_string()),
+    }
 }
 
 async fn populate_auth_test_target_report(

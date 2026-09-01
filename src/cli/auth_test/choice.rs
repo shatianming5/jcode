@@ -295,6 +295,9 @@ async fn run_provider_tool_smoke_for_choice(
                 .with_context(|| {
                     format!("Failed to initialize {} provider", choice.as_arg_value())
                 })?;
+        if provider.handles_tools_internally() {
+            return run_internal_provider_tool_smoke(provider).await;
+        }
         registry
             .register_mcp_tools(None, None, Some("auth-test".to_string()))
             .await;
@@ -324,6 +327,50 @@ async fn run_provider_tool_smoke_for_choice(
         Ok(output.trim().to_string())
     })
     .await
+}
+
+async fn run_internal_provider_tool_smoke(
+    provider: std::sync::Arc<dyn crate::provider::Provider>,
+) -> Result<String> {
+    let working_dir =
+        std::env::current_dir().context("Failed to determine auth-test working directory")?;
+    let request_context =
+        crate::provider::ProviderRequestContext::new(Some(working_dir));
+    let tools = [crate::message::ToolDefinition {
+        name: "agentgrep".to_string(),
+        description: "Read-only file listing and search".to_string(),
+        input_schema: serde_json::json!({"type":"object"}),
+    }];
+    let messages = [crate::message::Message::user(
+        DEFAULT_AUTH_TEST_INTERNAL_TOOL_PROMPT,
+    )];
+    let mut stream = provider
+        .complete_split_with_context(&messages, &tools, "", "", None, &request_context)
+        .await
+        .context("Internal provider tool smoke failed to open a response stream")?;
+    let mut output = String::new();
+    let mut status_details = Vec::new();
+    while let Some(event) = stream.next().await {
+        match event? {
+            crate::message::StreamEvent::TextDelta(text) => output.push_str(&text),
+            crate::message::StreamEvent::StatusDetail { detail } if !detail.trim().is_empty() => {
+                status_details.push(detail);
+            }
+            _ => {}
+        }
+    }
+    if status_details.is_empty() {
+        anyhow::bail!(
+            "internal tool smoke returned no ACP tool status evidence before the final response"
+        );
+    }
+    if output.trim() != "AUTH_TEST_OK" {
+        anyhow::bail!(
+            "internal tool smoke final response was {:?}, expected exactly AUTH_TEST_OK",
+            output.trim()
+        );
+    }
+    Ok(output.trim().to_string())
 }
 
 fn validate_auth_test_tool_smoke_transcript(

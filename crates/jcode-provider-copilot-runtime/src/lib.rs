@@ -1647,9 +1647,9 @@ impl acp::Client for CopilotAcpClient {
             return Ok(());
         }
         let event = match notification.update {
-            acp::SessionUpdate::AgentMessageChunk(chunk) => {
-                text_from_acp_content(chunk.content).map(StreamEvent::TextDelta)
-            }
+            acp::SessionUpdate::AgentMessageChunk(chunk) => text_from_acp_content(chunk.content)
+                .filter(|text| !is_official_cli_configuration_info(text))
+                .map(StreamEvent::TextDelta),
             acp::SessionUpdate::AgentThoughtChunk(chunk) => {
                 text_from_acp_content(chunk.content).map(StreamEvent::ThinkingDelta)
             }
@@ -1667,6 +1667,12 @@ impl acp::Client for CopilotAcpClient {
         }
         Ok(())
     }
+}
+
+fn is_official_cli_configuration_info(text: &str) -> bool {
+    text.starts_with("Info: Disabled tools: ")
+        || text.starts_with("Info: Unknown tool name in the tool allowlist: ")
+        || text.starts_with("Info: Unknown tool name in the tool excludedlist: ")
 }
 
 fn text_from_acp_content(content: acp::ContentBlock) -> Option<String> {

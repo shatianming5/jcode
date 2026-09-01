@@ -3612,6 +3612,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures",
+ "jcode-app-core",
  "jcode-base",
  "jcode-message-types",
  "jcode-provider-copilot",
