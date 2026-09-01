@@ -334,8 +334,8 @@ async fn run_internal_provider_tool_smoke(
 ) -> Result<String> {
     let working_dir =
         std::env::current_dir().context("Failed to determine auth-test working directory")?;
-    let request_context = crate::provider::ProviderRequestContext::new(Some(working_dir))
-        .with_configuration_info_as_lines();
+    let request_context =
+        crate::provider::ProviderRequestContext::new(Some(working_dir));
     let tools = [crate::message::ToolDefinition {
         name: "read".to_string(),
         description: "Read a file without modifying it".to_string(),
@@ -348,6 +348,36 @@ async fn run_internal_provider_tool_smoke(
         .complete_split_with_context(&messages, &tools, "", "", None, &request_context)
         .await
         .context("Internal provider tool smoke failed to open a response stream")?;
+    let (_tool_output, tool_updates) = collect_internal_provider_tool_stream(&mut stream).await?;
+    validate_internal_provider_tool_lifecycle(&tool_updates)?;
+    let confirmation_messages = [crate::message::Message::user(
+        DEFAULT_AUTH_TEST_PROVIDER_PROMPT,
+    )];
+    let mut confirmation_stream = provider
+        .complete_split_with_context(
+            &confirmation_messages,
+            &[],
+            "",
+            "",
+            None,
+            &request_context,
+        )
+        .await
+        .context("Internal provider tool smoke marker confirmation failed to open a stream")?;
+    let (confirmation, _) =
+        collect_internal_provider_tool_stream(&mut confirmation_stream).await?;
+    if confirmation.trim() != "AUTH_TEST_OK" {
+        anyhow::bail!(
+            "internal tool smoke marker confirmation was {:?}, expected exactly AUTH_TEST_OK",
+            confirmation.trim()
+        );
+    }
+    Ok(confirmation.trim().to_string())
+}
+
+async fn collect_internal_provider_tool_stream(
+    stream: &mut crate::provider::EventStream,
+) -> Result<(String, Vec<InternalToolUpdate>)> {
     let mut text_cleaner = AuthTestTextCleaner::default();
     let mut tool_updates = Vec::new();
     while let Some(event) = stream.next().await {
@@ -364,8 +394,7 @@ async fn run_internal_provider_tool_smoke(
         }
     }
     let output = text_cleaner.finish();
-    validate_internal_provider_tool_smoke(&tool_updates, &output)?;
-    Ok(output.trim().to_string())
+    Ok((output, tool_updates))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +458,7 @@ fn is_exact_auth_test_configuration_line(line: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn validate_internal_provider_tool_smoke(
     updates: &[InternalToolUpdate],
     output: &str,
@@ -439,6 +469,10 @@ fn validate_internal_provider_tool_smoke(
             output.trim()
         );
     }
+    validate_internal_provider_tool_lifecycle(updates)
+}
+
+fn validate_internal_provider_tool_lifecycle(updates: &[InternalToolUpdate]) -> Result<()> {
     let ids = updates
         .iter()
         .map(|update| update.id.as_str())
@@ -832,6 +866,31 @@ mod auth_tool_smoke_tests {
         cleaner.finish()
     }
 
+    fn provider_tool_stream(
+        events: Vec<crate::message::StreamEvent>,
+    ) -> crate::provider::EventStream {
+        Box::pin(futures::stream::iter(
+            events.into_iter().map(Ok::<_, anyhow::Error>),
+        ))
+    }
+
+    fn valid_internal_tool_events() -> Vec<crate::message::StreamEvent> {
+        vec![
+            crate::message::StreamEvent::ProviderToolUpdate {
+                id: "internal-1".to_string(),
+                kind: Some(crate::message::ProviderToolKind::Read),
+                status: Some(crate::message::ProviderToolStatus::Pending),
+                title: Some("Reading Cargo.toml".to_string()),
+            },
+            crate::message::StreamEvent::ProviderToolUpdate {
+                id: "internal-1".to_string(),
+                kind: None,
+                status: Some(crate::message::ProviderToolStatus::Completed),
+                title: None,
+            },
+        ]
+    }
+
     #[test]
     fn auth_test_configuration_cleaner_preserves_errors_in_original_order() {
         let output = clean_auth_test_chunks(&[
@@ -876,6 +935,64 @@ mod auth_tool_smoke_tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("Info: Disabled tools: bash, edit "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_stream_continuation_preserves_candidate_line_and_fails() {
+        let mut events = vec![
+            crate::message::StreamEvent::TextDelta(
+                "Info: Disabled tools: bash, edit".to_string(),
+            ),
+            crate::message::StreamEvent::TextDelta(" \nAUTH_TEST_OK".to_string()),
+        ];
+        events.extend(valid_internal_tool_events());
+        let mut stream = provider_tool_stream(events);
+
+        let (output, updates) = collect_internal_provider_tool_stream(&mut stream)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output,
+            "Info: Disabled tools: bash, edit \nAUTH_TEST_OK"
+        );
+        let error = validate_internal_provider_tool_smoke(&updates, &output)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Info: Disabled tools: bash, edit "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_stream_drops_exact_notification_only_at_eof() {
+        let mut stream = provider_tool_stream(vec![crate::message::StreamEvent::TextDelta(
+            "Info: Disabled tools: bash, edit".to_string(),
+        )]);
+
+        let (output, updates) = collect_internal_provider_tool_stream(&mut stream)
+            .await
+            .unwrap();
+
+        assert!(output.is_empty());
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_stream_notification_newline_then_marker_passes() {
+        let mut events = vec![
+            crate::message::StreamEvent::TextDelta(
+                "Info: Disabled tools: bash, edit\n".to_string(),
+            ),
+            crate::message::StreamEvent::TextDelta("AUTH_TEST_OK".to_string()),
+        ];
+        events.extend(valid_internal_tool_events());
+        let mut stream = provider_tool_stream(events);
+
+        let (output, updates) = collect_internal_provider_tool_stream(&mut stream)
+            .await
+            .unwrap();
+
+        assert_eq!(output, "AUTH_TEST_OK");
+        validate_internal_provider_tool_smoke(&updates, &output).unwrap();
     }
 
     #[test]

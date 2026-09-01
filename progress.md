@@ -67,6 +67,11 @@
   buffered until an explicit newline or EOF; a later trailing space/body keeps
   the whole line and fails strict output validation, while an exact
   newline-free notification may be removed only at EOF.
+- The provider now forwards ACP text chunks byte-for-byte with no auth-test flag
+  or chunk-boundary newline synthesis. End-to-end provider-event tests cover
+  continued candidate lines, exact EOF removal, and newline-delimited marker
+  success. Internal tool smoke validates the tool lifecycle first, then performs
+  a separate no-tool marker confirmation through the same line cleaner.
 - Provider-tool validation now enforces monotonic per-ID transitions:
   Pending→Completed and InProgress→Completed pass; Completed-only,
   Pending→Completed→InProgress, failed, incomplete, and wrong-kind sequences

@@ -96,7 +96,6 @@ struct CopilotOfficialToolPolicy {
     allow_write: bool,
     allow_execute: bool,
     allow_fetch: bool,
-    configuration_info_as_lines: bool,
 }
 
 impl CopilotOfficialToolPolicy {
@@ -666,7 +665,6 @@ impl CopilotApiProvider {
         system: &str,
         resume_session_id: Option<&str>,
         working_dir: PathBuf,
-        configuration_info_as_lines: bool,
     ) -> Result<EventStream> {
         self.wait_for_init().await;
         let CopilotBackend::OfficialCli { process } = &self.backend else {
@@ -676,8 +674,7 @@ impl CopilotApiProvider {
         let process = process.clone();
         let selected_model = self.model();
         let resume_session_id = resume_session_id.map(ToOwned::to_owned);
-        let mut tool_policy = CopilotOfficialToolPolicy::from_jcode_tools(tools);
-        tool_policy.configuration_info_as_lines = configuration_info_as_lines;
+        let tool_policy = CopilotOfficialToolPolicy::from_jcode_tools(tools);
         let (tx, rx) = mpsc::channel(128);
         let (cancel_tx, cancel_rx) = oneshot::channel();
 
@@ -1668,15 +1665,7 @@ impl acp::Client for CopilotAcpClient {
         }
         let events: Vec<StreamEvent> = match notification.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => text_from_acp_content(chunk.content)
-                .map(|mut text| {
-                    if self.tool_policy.configuration_info_as_lines
-                        && !text.contains('\n')
-                        && is_exact_official_cli_configuration_info(&text)
-                    {
-                        text.push('\n');
-                    }
-                    StreamEvent::TextDelta(text)
-                })
+                .map(StreamEvent::TextDelta)
                 .into_iter()
                 .collect(),
             acp::SessionUpdate::AgentThoughtChunk(chunk) => text_from_acp_content(chunk.content)
@@ -1742,33 +1731,6 @@ fn provider_tool_status(status: acp::ToolCallStatus) -> ProviderToolStatus {
     }
 }
 
-fn is_exact_official_cli_configuration_info(text: &str) -> bool {
-    if let Some(tools) = text.strip_prefix("Info: Disabled tools: ") {
-        let tools = tools.split(", ").collect::<Vec<_>>();
-        return !tools.is_empty()
-            && tools.iter().all(|tool| {
-                !tool.is_empty()
-                    && tool.chars().all(|character| {
-                        character.is_ascii_lowercase()
-                            || character.is_ascii_digit()
-                            || "_-.".contains(character)
-                    })
-            });
-    }
-    for prefix in [
-        "Info: Unknown tool name in the tool allowlist: \"",
-        "Info: Unknown tool name in the tool excludedlist: \"",
-    ] {
-        if let Some(name) = text
-            .strip_prefix(prefix)
-            .and_then(|line| line.strip_suffix('"'))
-        {
-            return !name.is_empty() && !name.contains('"');
-        }
-    }
-    false
-}
-
 fn text_from_acp_content(content: acp::ContentBlock) -> Option<String> {
     match content {
         acp::ContentBlock::Text(text) => Some(text.text),
@@ -1805,14 +1767,7 @@ impl Provider for CopilotApiProvider {
             let working_dir =
                 std::env::current_dir().context("Failed to determine working directory")?;
             return self
-                .complete_official(
-                    messages,
-                    tools,
-                    system,
-                    resume_session_id,
-                    working_dir,
-                    false,
-                )
+                .complete_official(messages, tools, system, resume_session_id, working_dir)
                 .await;
         }
 
@@ -1937,7 +1892,6 @@ impl Provider for CopilotApiProvider {
                     system_static,
                     resume_session_id,
                     working_dir,
-                    request_context.configuration_info_as_lines,
                 )
                 .await;
         }

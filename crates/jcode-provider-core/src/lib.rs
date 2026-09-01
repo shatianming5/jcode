@@ -80,20 +80,11 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProviderRequestContext {
     pub working_dir: Option<PathBuf>,
-    pub configuration_info_as_lines: bool,
 }
 
 impl ProviderRequestContext {
     pub fn new(working_dir: Option<PathBuf>) -> Self {
-        Self {
-            working_dir,
-            configuration_info_as_lines: false,
-        }
-    }
-
-    pub fn with_configuration_info_as_lines(mut self) -> Self {
-        self.configuration_info_as_lines = true;
-        self
+        Self { working_dir }
     }
 }
 
