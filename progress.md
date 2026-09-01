@@ -23,7 +23,7 @@
 - New login shell coding smoke: official CLI read `progress.md`, emitted ACP
   tool status, and returned `# Copilot official CLI transport`.
 - Installed at
-  `~/.jcode/builds/versions/0.81.5-dev-copilot-official-acp.1/jcode`; stable and
+  `~/.jcode/builds/versions/0.81.7-dev-5067d2f5a/jcode`; stable and
   `~/.local/bin/jcode` resolve to that binary, with v0.81.4 retained.
 - `verify.sh --scan .` still reports the repository's pre-existing fake
   long-form credential fixtures; the change diff contains no credential value.
