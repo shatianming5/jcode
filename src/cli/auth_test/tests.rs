@@ -84,7 +84,7 @@ for line in sys.stdin:
                     "sessionUpdate": "agent_message_chunk",
                     "content": {
                         "type": "text",
-                        "text": "Info: Disabled tools: bash, edit, write",
+                        "text": "Info: Disabled tools: bash, edit, write\n",
                     },
                 },
             },

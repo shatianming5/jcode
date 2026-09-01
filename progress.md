@@ -63,6 +63,10 @@
   exact configuration-notice lines. A retained `ERROR` before `AUTH_TEST_OK`
   fails strict output validation, while split notification/marker chunks and
   legitimate `Info:` text preserve order and content.
+- Configuration-line candidates are never deleted at chunk arrival. They remain
+  buffered until an explicit newline or EOF; a later trailing space/body keeps
+  the whole line and fails strict output validation, while an exact
+  newline-free notification may be removed only at EOF.
 - Provider-tool validation now enforces monotonic per-ID transitions:
   Pending→Completed and InProgress→Completed pass; Completed-only,
   Pending→Completed→InProgress, failed, incomplete, and wrong-kind sequences

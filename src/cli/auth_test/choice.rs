@@ -334,8 +334,8 @@ async fn run_internal_provider_tool_smoke(
 ) -> Result<String> {
     let working_dir =
         std::env::current_dir().context("Failed to determine auth-test working directory")?;
-    let request_context =
-        crate::provider::ProviderRequestContext::new(Some(working_dir));
+    let request_context = crate::provider::ProviderRequestContext::new(Some(working_dir))
+        .with_configuration_info_as_lines();
     let tools = [crate::message::ToolDefinition {
         name: "read".to_string(),
         description: "Read a file without modifying it".to_string(),
@@ -383,12 +383,6 @@ struct AuthTestTextCleaner {
 
 impl AuthTestTextCleaner {
     fn push_chunk(&mut self, text: &str) {
-        if self.pending.is_empty()
-            && !text.contains('\n')
-            && is_exact_auth_test_configuration_line(text)
-        {
-            return;
-        }
         self.pending.push_str(text);
         while let Some(newline) = self.pending.find('\n') {
             let line = self.pending[..newline].to_string();
@@ -860,9 +854,34 @@ mod auth_tool_smoke_tests {
     }
 
     #[test]
+    fn auth_test_configuration_cleaner_does_not_drop_candidate_before_newline() {
+        let output = clean_auth_test_chunks(&[
+            "Info: Disabled tools: bash, edit",
+            " \nAUTH_TEST_OK",
+        ]);
+        assert_eq!(
+            output,
+            "Info: Disabled tools: bash, edit \nAUTH_TEST_OK"
+        );
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            &output,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Info: Disabled tools: bash, edit "), "{error}");
+    }
+
+    #[test]
     fn auth_test_configuration_cleaner_handles_notification_and_marker_chunks() {
         assert_eq!(
-            clean_auth_test_chunks(&["Info: Disabled tools: bash, edit", "AUTH_TEST_OK"]),
+            clean_auth_test_chunks(&["Info: Disabled tools: bash, edit\n", "AUTH_TEST_OK"]),
             "AUTH_TEST_OK"
         );
         assert_eq!(
@@ -872,6 +891,14 @@ mod auth_tool_smoke_tests {
                 "AUTH_TEST_OK"
             ]),
             "AUTH_TEST_OK"
+        );
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_drops_exact_notification_at_eof() {
+        assert_eq!(
+            clean_auth_test_chunks(&["Info: Disabled tools: bash, edit"]),
+            ""
         );
     }
 
