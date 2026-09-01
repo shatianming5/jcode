@@ -60,6 +60,27 @@ async fn agent_with_provider_session(
 }
 
 #[tokio::test]
+async fn attached_agent_restores_persisted_provider_session_id() {
+    let provider: Arc<dyn Provider> = Arc::new(OpaqueSessionProvider {
+        model: Arc::new(Mutex::new("claude-sonnet-4.6".to_string())),
+    });
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let mut session = Session::create_with_id("local-restored".to_string(), None, None);
+    session.provider_session_id = Some("upstream-restored".to_string());
+
+    let agent = Agent::new_with_session(provider, registry, session, None);
+
+    assert_eq!(
+        agent.provider_session_id.as_deref(),
+        Some("upstream-restored")
+    );
+    assert_eq!(
+        agent.session.provider_session_id.as_deref(),
+        Some("upstream-restored")
+    );
+}
+
+#[tokio::test]
 async fn official_copilot_model_switch_preserves_each_local_sessions_upstream_id() {
     let provider: Arc<dyn Provider> = Arc::new(OpaqueSessionProvider {
         model: Arc::new(Mutex::new("claude-sonnet-4.6".to_string())),

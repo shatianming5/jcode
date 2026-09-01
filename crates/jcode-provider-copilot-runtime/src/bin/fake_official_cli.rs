@@ -38,6 +38,7 @@ fn response(id: Value, result: Value) {
 fn main() {
     append_log(&json!({
         "process": {
+            "pid": std::process::id(),
             "args": std::env::args().skip(1).collect::<Vec<_>>(),
             "cwd": std::env::current_dir().expect("fake cwd"),
             "sentinel": std::env::var("JCODE_FAKE_COPILOT_PARENT_SENTINEL").ok(),
@@ -69,32 +70,52 @@ fn main() {
                     }]
                 }),
             ),
-            "session/new" => response(
-                id,
-                json!({
-                    "sessionId": if stale_load_seen {
-                        "recovered-copilot-session"
-                    } else {
-                        "fake-copilot-session"
-                    },
-                    "models": {
-                        "currentModelId":"claude-sonnet-4.6",
-                        "availableModels":[
-                            {"modelId":"claude-sonnet-4.6", "name":"Claude Sonnet 4.6"},
-                            {"modelId":"gpt-5-mini", "name":"GPT-5 mini"}
-                        ]
-                    }
-                }),
-            ),
+            "session/new" => {
+                if stale_load_seen
+                    && std::env::var_os("JCODE_FAKE_COPILOT_ACP_FAIL_STALE_NEW").is_some()
+                {
+                    send(json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "error":{"code":-32000, "message":"fake stale replacement failure"}
+                    }));
+                    continue;
+                }
+                response(
+                    id,
+                    json!({
+                        "sessionId": if stale_load_seen {
+                            "recovered-copilot-session"
+                        } else {
+                            "fake-copilot-session"
+                        },
+                        "models": {
+                            "currentModelId":"claude-sonnet-4.6",
+                            "availableModels":[
+                                {"modelId":"claude-sonnet-4.6", "name":"Claude Sonnet 4.6"},
+                                {"modelId":"gpt-5-mini", "name":"GPT-5 mini"}
+                            ]
+                        }
+                    }),
+                );
+            }
             "session/load" => {
-                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND").is_some() {
+                let requested_session_id =
+                    value["params"]["sessionId"].as_str().unwrap_or_default();
+                let configured_stale_id =
+                    std::env::var("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND_ID").ok();
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND").is_some()
+                    || configured_stale_id.as_deref() == Some(requested_session_id)
+                {
                     stale_load_seen = true;
                     send(json!({
                         "jsonrpc":"2.0",
                         "id":id,
                         "error":{
                             "code":-32002,
-                            "message":"Resource not found: Session fake-copilot-session not found"
+                            "message":format!(
+                                "Resource not found: Session {requested_session_id} not found"
+                            )
                         }
                     }));
                     continue;
@@ -125,8 +146,21 @@ fn main() {
             }
             "session/set_model" => response(id, json!({})),
             "session/prompt" => {
-                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_HANG").is_some() {
+                let prompt_json = value["params"]["prompt"].to_string();
+                let hang_match = std::env::var("JCODE_FAKE_COPILOT_ACP_HANG_PROMPT_MATCH").ok();
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_HANG").is_some()
+                    || hang_match
+                        .as_deref()
+                        .is_some_and(|needle| prompt_json.contains(needle))
+                {
                     continue;
+                }
+                if std::env::var("JCODE_FAKE_COPILOT_ACP_CRASH_PROMPT_MATCH")
+                    .ok()
+                    .as_deref()
+                    .is_some_and(|needle| prompt_json.contains(needle))
+                {
+                    return;
                 }
                 if std::env::var_os("JCODE_FAKE_COPILOT_ACP_FAIL").is_some() {
                     eprintln!("official Copilot CLI request failed");
@@ -233,7 +267,41 @@ fn main() {
                     return;
                 }
             }
-            "session/cancel" => break,
+            "session/cancel" => {
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_IGNORE_CANCEL").is_some() {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_LATE_AFTER_CANCEL").is_some() {
+                    send(json!({
+                        "jsonrpc":"2.0",
+                        "method":"session/update",
+                        "params":{
+                            "sessionId":"fake-copilot-session",
+                            "update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text", "text":"LATE_CANCELLED_TEXT"}
+                            }
+                        }
+                    }));
+                    send(json!({
+                        "jsonrpc":"2.0",
+                        "method":"session/update",
+                        "params":{
+                            "sessionId":"fake-copilot-session",
+                            "update":{
+                                "sessionUpdate":"tool_call",
+                                "toolCallId":"late-tool",
+                                "title":"LATE_CANCELLED_TOOL",
+                                "kind":"execute",
+                                "status":"pending"
+                            }
+                        }
+                    }));
+                }
+                append_log(&json!({"process_exit":"cancelled"}));
+                break;
+            }
             other => panic!("unexpected ACP method: {other}"),
         }
     }

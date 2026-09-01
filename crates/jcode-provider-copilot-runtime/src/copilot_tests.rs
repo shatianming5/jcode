@@ -89,25 +89,8 @@ fn one_per_session_forks_each_start_with_their_own_first_turn() {
 }
 
 #[test]
-fn stale_recovery_only_embeds_proven_safe_text_history() {
-    let safe_messages = [
-        ChatMessage::user("old question"),
-        ChatMessage::assistant_text("old answer"),
-        ChatMessage::user("current question"),
-    ];
-    let safe = build_stale_recovery_context(&safe_messages, "", OfficialHistorySafety::Safe);
-    assert!(safe.allowed);
-    assert!(
-        safe.resource
-            .as_deref()
-            .is_some_and(|resource| resource.contains("READ-ONLY historical transcript"))
-    );
-
-    let unknown = build_stale_recovery_context(&safe_messages, "", OfficialHistorySafety::Unknown);
-    assert!(!unknown.allowed);
-    assert!(unknown.resource.is_none());
-
-    let side_effect_messages = [
+fn stale_recovery_uses_only_current_system_and_current_user_prompt() {
+    let messages = [
         ChatMessage::user("old question"),
         ChatMessage {
             role: Role::Assistant,
@@ -120,12 +103,31 @@ fn stale_recovery_only_embeds_proven_safe_text_history() {
             timestamp: None,
             tool_duration_ms: None,
         },
-        ChatMessage::user("current question"),
+        ChatMessage::user("failed prompt that must not replay"),
+        ChatMessage::user("current prompt"),
     ];
-    let side_effect =
-        build_stale_recovery_context(&side_effect_messages, "", OfficialHistorySafety::Safe);
-    assert!(!side_effect.allowed);
-    assert!(side_effect.resource.is_none());
+
+    let prompt =
+        build_stale_fresh_prompt(&messages, "current system", Some("current prompt")).unwrap();
+
+    assert!(prompt.contains("current system"));
+    assert_eq!(prompt.matches("current prompt").count(), 1);
+    assert!(!prompt.contains("old question"));
+    assert!(!prompt.contains("touch marker"));
+    assert!(!prompt.contains("failed prompt"));
+}
+
+#[test]
+fn legacy_official_session_markers_only_unwrap_the_upstream_id() {
+    assert_eq!(
+        parse_official_session_id("jcode-copilot-acp-v1:safe:upstream-one"),
+        "upstream-one"
+    );
+    assert_eq!(
+        parse_official_session_id("jcode-copilot-acp-v1:unsafe:upstream-two"),
+        "upstream-two"
+    );
+    assert_eq!(parse_official_session_id("plain-id"), "plain-id");
 }
 
 #[test]

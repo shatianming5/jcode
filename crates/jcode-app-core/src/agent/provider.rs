@@ -1,6 +1,46 @@
 use super::*;
 
 impl Agent {
+    pub(super) fn current_user_prompt_for_provider(&self) -> Option<String> {
+        let message = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == crate::message::Role::User)?;
+        let mut parts = Vec::new();
+        for block in &message.content {
+            match block {
+                crate::message::ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                    parts.push(text.clone());
+                }
+                crate::message::ContentBlock::ToolResult { content, .. }
+                    if !content.trim().is_empty() =>
+                {
+                    parts.push(content.clone());
+                }
+                _ => {}
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    pub(super) fn persist_provider_session_id(&mut self, session_id: String) -> Result<()> {
+        if self.provider_session_id.as_deref() == Some(session_id.as_str())
+            && self.session.provider_session_id.as_deref() == Some(session_id.as_str())
+        {
+            return Ok(());
+        }
+        let previous_agent = self.provider_session_id.replace(session_id.clone());
+        let previous_session = self.session.provider_session_id.replace(session_id);
+        if let Err(error) = self.session.save() {
+            self.provider_session_id = previous_agent;
+            self.session.provider_session_id = previous_session;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn set_premium_mode(&self, mode: crate::provider::copilot::PremiumMode) {
         self.provider.set_premium_mode(mode);
     }

@@ -80,11 +80,20 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProviderRequestContext {
     pub working_dir: Option<PathBuf>,
+    pub current_user_prompt: Option<String>,
 }
 
 impl ProviderRequestContext {
     pub fn new(working_dir: Option<PathBuf>) -> Self {
-        Self { working_dir }
+        Self {
+            working_dir,
+            current_user_prompt: None,
+        }
+    }
+
+    pub fn with_current_user_prompt(mut self, prompt: Option<String>) -> Self {
+        self.current_user_prompt = prompt;
+        self
     }
 }
 

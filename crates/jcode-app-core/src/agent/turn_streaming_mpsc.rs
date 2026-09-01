@@ -227,7 +227,8 @@ impl Agent {
             let model_at_request_start = provider.model().to_string();
             let resume_session_id = self.provider_session_id.clone();
             let request_context =
-                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from));
+                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from))
+                    .with_current_user_prompt(self.current_user_prompt_for_provider());
             self.last_status_detail = None;
             let _ = event_tx.send(kv_cache_request_event(
                 &cache_signature_messages,
@@ -797,8 +798,7 @@ impl Agent {
                         });
                     }
                     StreamEvent::SessionId(sid) => {
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid.clone());
+                        self.persist_provider_session_id(sid.clone())?;
                         let _ = event_tx.send(ServerEvent::SessionId { session_id: sid });
                     }
                     StreamEvent::OpenAIReasoning {

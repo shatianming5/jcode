@@ -145,7 +145,8 @@ impl Agent {
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
             let request_context =
-                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from));
+                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from))
+                    .with_current_user_prompt(self.current_user_prompt_for_provider());
             let mut stream = match self
                 .provider
                 .complete_split_with_context(
@@ -532,8 +533,7 @@ impl Agent {
                         if trace {
                             eprintln!("[trace] session_id {}", sid);
                         }
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid);
+                        self.persist_provider_session_id(sid)?;
                         // We've received session_id, can exit the loop now
                         if saw_message_end {
                             break;

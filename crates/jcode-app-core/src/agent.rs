@@ -428,6 +428,7 @@ impl Agent {
             tool_selection.allowed_tools,
             tool_selection.disabled_tools,
         );
+        agent.provider_session_id = agent.session.provider_session_id.clone();
         agent.session.mark_active();
         if agent.session.provider_key.is_none() {
             agent.session.provider_key = agent.provider_key_for_new_session();
