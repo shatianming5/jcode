@@ -1374,20 +1374,31 @@ impl NativeProviderKind {
                 auth_env_key: Some("CURSOR_API_KEY"),
                 login_hint: "jcode login --provider cursor",
             },
-            Self::Copilot => NativeProviderSpec {
-                provider_id: "copilot",
-                label: "GitHub Copilot",
-                contract: WiringContract {
-                    api_method: "copilot".to_string(),
-                    route_provider: "Copilot".to_string(),
-                    expected_runtime: "copilot",
-                    expected_namespace: None,
-                    switch_prefix: "copilot:".to_string(),
-                },
-                auth_source: "GitHub Copilot device-flow token via hosts.json",
-                auth_env_key: None,
-                login_hint: "jcode login --provider copilot",
-            },
+            Self::Copilot => {
+                let official_cli = jcode_base::provider::copilot::official_cli_selected();
+                NativeProviderSpec {
+                    provider_id: "copilot",
+                    label: "GitHub Copilot",
+                    contract: WiringContract {
+                        api_method: "copilot".to_string(),
+                        route_provider: "Copilot".to_string(),
+                        expected_runtime: "copilot",
+                        expected_namespace: None,
+                        switch_prefix: "copilot:".to_string(),
+                    },
+                    auth_source: if official_cli {
+                        "Official Copilot CLI inherited process environment"
+                    } else {
+                        "GitHub Copilot device-flow token via hosts.json"
+                    },
+                    auth_env_key: None,
+                    login_hint: if official_cli {
+                        "verify JCODE_COPILOT_CLI_PATH and the inherited CLI environment"
+                    } else {
+                        "jcode login --provider copilot"
+                    },
+                }
+            }
             Self::Bedrock => NativeProviderSpec {
                 provider_id: "bedrock",
                 label: "AWS Bedrock",
@@ -1471,22 +1482,32 @@ impl NativeProviderKind {
                 std::sync::Arc::new(jcode_provider_cursor_runtime::CursorCliProvider::new())
             }
             Self::Copilot => {
-                // `new()` requires a loadable GitHub token; fall back to an empty
-                // token so the offline tier can still construct the runtime for
-                // its static catalog. Live tiers resolve the real credential
-                // separately and fail with a clear message if it is missing.
-                //
-                // Disable the startup prefetch grace window: the runtime's
-                // `complete` blocks on `wait_for_init`, which is only released by
-                // `detect_tier_and_set_default` (run from `prefetch_models`). With
-                // the default grace window the doctor's immediate prefetch returns
-                // early without marking init done, so the live probes would hang.
-                jcode_base::env::set_var("JCODE_COPILOT_PREFETCH_STARTUP_GRACE_MS", "0");
-                let runtime = match jcode_provider_copilot_runtime::CopilotApiProvider::new() {
-                    Ok(runtime) => runtime,
-                    Err(_) => jcode_provider_copilot_runtime::CopilotApiProvider::new_with_token(
-                        String::new(),
-                    ),
+                let runtime = if jcode_base::provider::copilot::official_cli_selected() {
+                    jcode_provider_copilot_runtime::CopilotApiProvider::new()
+                        .context("construct official Copilot CLI runtime")?
+                } else {
+                    // `new()` requires a loadable GitHub token; fall back to an empty
+                    // token so the offline tier can still construct the runtime for
+                    // its static catalog. Live tiers resolve the real credential
+                    // separately and fail with a clear message if it is missing.
+                    //
+                    // Disable the startup prefetch grace window: the runtime's
+                    // `complete` blocks on `wait_for_init`, which is only released by
+                    // `detect_tier_and_set_default` (run from `prefetch_models`). With
+                    // the default grace window the doctor's immediate prefetch returns
+                    // early without marking init done, so the live probes would hang.
+                    jcode_base::env::set_var("JCODE_COPILOT_PREFETCH_STARTUP_GRACE_MS", "0");
+                    match jcode_provider_copilot_runtime::CopilotApiProvider::new() {
+                        Ok(runtime) => runtime,
+                        Err(_) => {
+                            jcode_provider_copilot_runtime::CopilotApiProvider::new_with_token(
+                                String::new(),
+                            )
+                        }
+                    }
+                };
+                if jcode_base::provider::copilot::official_cli_selected() {
+                    runtime.complete_init_without_tier_detection();
                 };
                 std::sync::Arc::new(runtime)
             }
@@ -1546,6 +1567,18 @@ impl NativeProviderKind {
                 Ok("Cursor credential resolved".to_string())
             }
             Self::Copilot => {
+                if jcode_base::provider::copilot::official_cli_selected() {
+                    let runtime = jcode_provider_copilot_runtime::CopilotApiProvider::new()
+                        .context("construct official Copilot CLI runtime")?;
+                    runtime
+                        .probe_official_cli()
+                        .await
+                        .context("official Copilot CLI ACP handshake")?;
+                    return Ok(
+                        "Official Copilot CLI ACP handshake succeeded; authentication remains CLI-managed"
+                            .to_string(),
+                    );
+                }
                 let token = jcode_base::auth::copilot::load_github_token()
                     .context("load GitHub Copilot token (run `jcode login --provider copilot`)")?;
                 if token.trim().is_empty() {
@@ -1662,10 +1695,19 @@ pub async fn run_generic_native_e2e(
                 detail,
             )),
             Err(error) => {
+                let detail = if kind == NativeProviderKind::Copilot
+                    && jcode_base::provider::copilot::official_cli_selected()
+                {
+                    format!(
+                        "{error}. Check JCODE_COPILOT_CLI_PATH and the inherited official CLI environment."
+                    )
+                } else {
+                    format!("{error}. Run `{}` to sign in.", spec.login_hint)
+                };
                 checks.push(DoctorCheck::failed(
                     checkpoints::AUTH_CREDENTIAL_LOADED,
                     label_for(checkpoints::AUTH_CREDENTIAL_LOADED),
-                    format!("{error}. Run `{}` to sign in.", spec.login_hint),
+                    detail,
                 ));
                 return Ok(finish_report(
                     provider_id,

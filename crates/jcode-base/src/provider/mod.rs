@@ -1153,9 +1153,7 @@ impl MultiProvider {
             }
             ActiveProvider::Copilot => {
                 let Some(copilot) = self.copilot_provider() else {
-                    anyhow::bail!(
-                        "GitHub Copilot credentials not available. Run `jcode login --provider copilot` first."
-                    );
+                    anyhow::bail!(copilot::unavailable_message());
                 };
                 copilot.set_model(model)?;
                 self.set_active_provider(ActiveProvider::Copilot);
@@ -1449,11 +1447,11 @@ impl MultiProvider {
         if !already_has {
             let status = crate::auth::AuthStatus::check_fast();
             // The composition-root factory schedules tier detection itself.
-            if status.copilot_has_api_token
+            if (status.copilot_has_api_token || copilot::official_cli_configured())
                 && let Some(provider) =
                     external::instantiate_expected_external_provider(external::COPILOT_RUNTIME)
             {
-                crate::logging::info("Hot-initialized Copilot API provider after login");
+                crate::logging::info("Hot-initialized Copilot provider after auth change");
                 *self
                     .copilot_api
                     .write()
@@ -2523,6 +2521,7 @@ impl Provider for MultiProvider {
     fn transport(&self) -> Option<String> {
         match self.active_provider() {
             ActiveProvider::OpenAI => self.openai_provider().and_then(|o| o.transport()),
+            ActiveProvider::Copilot => self.copilot_provider().and_then(|o| o.transport()),
             _ => None,
         }
     }
@@ -2533,8 +2532,12 @@ impl Provider for MultiProvider {
                 .openai_provider()
                 .ok_or_else(|| anyhow::anyhow!("OpenAI provider not available"))?
                 .set_transport(transport),
+            ActiveProvider::Copilot => self
+                .copilot_provider()
+                .ok_or_else(|| anyhow::anyhow!(copilot::unavailable_message()))?
+                .set_transport(transport),
             _ => Err(anyhow::anyhow!(
-                "Transport switching is only supported for OpenAI models"
+                "Transport switching is only supported for OpenAI and Copilot models"
             )),
         }
     }
@@ -2543,6 +2546,10 @@ impl Provider for MultiProvider {
         match self.active_provider() {
             ActiveProvider::OpenAI => self
                 .openai_provider()
+                .map(|o| o.available_transports())
+                .unwrap_or_default(),
+            ActiveProvider::Copilot => self
+                .copilot_provider()
                 .map(|o| o.available_transports())
                 .unwrap_or_default(),
             ActiveProvider::Gemini => vec![],

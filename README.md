@@ -347,6 +347,30 @@ jcode works with subscription-backed OAuth flows and many provider integrations,
 
 For custom OpenAI-compatible endpoints, jcode now prompts for the API base and supports local localhost servers without requiring an API key.
 
+### GitHub Copilot transports
+
+Copilot keeps the existing direct API transport by default:
+
+```bash
+export JCODE_COPILOT_TRANSPORT=native
+```
+
+To delegate the provider session to the official GitHub Copilot CLI over its
+public ACP stdio interface, select `official-cli` and point jcode at the raw
+Copilot binary:
+
+```bash
+export JCODE_COPILOT_TRANSPORT=official-cli
+export JCODE_COPILOT_CLI_PATH=/opt/homebrew/bin/copilot
+jcode run --provider copilot --model claude-sonnet-4.6 'Reply with exactly OK.'
+```
+
+In `official-cli` mode jcode does not load, exchange, copy, or persist a GitHub
+token and does not invoke `copilot login`; the child inherits the parent
+process environment exactly as a normal CLI invocation would. The transport is
+selected once when the provider is constructed, and an official CLI failure
+does not fall back to the native Copilot API path.
+
 ### Config-file setup for self-hosted endpoints and MCP
 
 If you prefer to configure things by editing files instead of using the login UI, jcode supports both a custom OpenAI-compatible endpoint config and MCP config files.

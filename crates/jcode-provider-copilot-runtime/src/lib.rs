@@ -1,13 +1,15 @@
-//! GitHub Copilot provider runtime (direct API with bearer-token exchange,
-//! tier detection, premium request modes), moved out of `jcode-base` so
-//! provider edits compile only this crate plus a binary relink instead of
-//! rebuilding the base -> app-core -> tui spine. The binary's composition
-//! root registers [`CopilotApiProvider`] with `jcode_base::provider::external`
-//! at startup.
+//! GitHub Copilot provider runtime with an explicit native API or official CLI
+//! ACP transport. It lives outside `jcode-base` so provider edits compile only
+//! this crate plus a binary relink instead of rebuilding the base -> app-core
+//! -> tui spine. The binary's composition root registers
+//! [`CopilotApiProvider`] with `jcode_base::provider::external` at startup.
 
-use anyhow::Result;
+use acp::Agent as _;
+use agent_client_protocol as acp;
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::Stream;
 use jcode_base::auth::copilot as copilot_auth;
 use jcode_message_types::{
     ContentBlock, Message as ChatMessage, Role, StreamEvent, ToolDefinition,
@@ -15,18 +17,33 @@ use jcode_message_types::{
 #[cfg(test)]
 use jcode_provider_copilot::max_token_parameter_for_model as copilot_max_token_parameter_for_model;
 use jcode_provider_copilot::{
-    COPILOT_API_VERSION, PersistedCatalog,
+    COPILOT_API_VERSION, CopilotTransport, PersistedCatalog,
     add_max_token_parameter as add_copilot_max_token_parameter,
     build_messages as build_copilot_messages, build_tools as build_copilot_tools,
+    official_cli_path_from_env,
 };
 use jcode_provider_copilot::{DEFAULT_MODEL, FALLBACK_MODELS};
 pub use jcode_provider_core::PremiumMode;
 use jcode_provider_core::{EventStream, Provider};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
+
+const ACP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const ACP_PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const STDERR_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatalogSource {
@@ -35,18 +52,69 @@ enum CatalogSource {
     Live,
 }
 
-/// Copilot API provider - uses GitHub Copilot's OpenAI-compatible API.
-/// Authenticates via GitHub OAuth token, exchanges for Copilot bearer token,
-/// and sends requests to api.githubcopilot.com.
+#[derive(Clone, Debug)]
+pub struct CopilotOfficialCliProcess {
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl CopilotOfficialCliProcess {
+    pub fn from_env() -> Result<Self> {
+        let command = official_cli_path_from_env().map_err(anyhow::Error::msg)?;
+        Ok(Self::with_command(command))
+    }
+
+    pub fn with_command(command: PathBuf) -> Self {
+        Self {
+            command,
+            args: vec![
+                "--acp".to_string(),
+                "--stdio".to_string(),
+                "--no-auto-update".to_string(),
+                "--log-level".to_string(),
+                "none".to_string(),
+                "--no-custom-instructions".to_string(),
+            ],
+            env: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+}
+
+#[derive(Clone)]
+enum CopilotBackend {
+    Native {
+        client: reqwest::Client,
+        github_token: String,
+        bearer_token: Arc<tokio::sync::RwLock<Option<copilot_auth::CopilotApiToken>>>,
+        session_id: String,
+        machine_id: String,
+    },
+    OfficialCli {
+        process: CopilotOfficialCliProcess,
+    },
+}
+
+impl CopilotBackend {
+    fn transport(&self) -> CopilotTransport {
+        match self {
+            Self::Native { .. } => CopilotTransport::Native,
+            Self::OfficialCli { .. } => CopilotTransport::OfficialCli,
+        }
+    }
+}
+
+/// Copilot provider with native API and official CLI ACP backends.
 pub struct CopilotApiProvider {
-    client: reqwest::Client,
+    backend: CopilotBackend,
     model: Arc<RwLock<String>>,
-    github_token: String,
-    bearer_token: Arc<tokio::sync::RwLock<Option<copilot_auth::CopilotApiToken>>>,
     fetched_models: Arc<RwLock<Vec<String>>>,
     catalog_source: Arc<RwLock<CatalogSource>>,
-    session_id: String,
-    machine_id: String,
     init_ready: Arc<tokio::sync::Notify>,
     init_done: Arc<std::sync::atomic::AtomicBool>,
     premium_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -158,19 +226,26 @@ impl CopilotApiProvider {
     }
 
     pub fn new() -> Result<Self> {
-        let github_token = copilot_auth::load_github_token()?;
+        match CopilotTransport::from_env().map_err(anyhow::Error::msg)? {
+            CopilotTransport::Native => {
+                let github_token = copilot_auth::load_github_token()?;
+                Ok(Self::new_with_token(github_token))
+            }
+            CopilotTransport::OfficialCli => Ok(Self::with_official_process(
+                CopilotOfficialCliProcess::from_env()?,
+            )),
+        }
+    }
+
+    fn common(backend: CopilotBackend) -> Self {
         let model =
             std::env::var("JCODE_COPILOT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
 
         let provider = Self {
-            client: jcode_provider_core::shared_http_client(),
+            backend,
             model: Arc::new(RwLock::new(model)),
-            github_token,
-            bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
             fetched_models: Arc::new(RwLock::new(Vec::new())),
             catalog_source: Arc::new(RwLock::new(CatalogSource::None)),
-            session_id: Uuid::new_v4().to_string(),
-            machine_id: Self::get_or_create_machine_id(),
             init_ready: Arc::new(tokio::sync::Notify::new()),
             init_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(Self::env_premium_mode())),
@@ -178,12 +253,18 @@ impl CopilotApiProvider {
             reasoning_effort: Arc::new(RwLock::new(None)),
             created_at: std::time::Instant::now(),
         };
-        provider.seed_cached_catalog();
-        Ok(provider)
+        if matches!(&provider.backend, CopilotBackend::Native { .. }) {
+            provider.seed_cached_catalog();
+        }
+        provider
     }
 
     pub fn has_credentials() -> bool {
-        copilot_auth::has_copilot_credentials()
+        match CopilotTransport::from_env() {
+            Ok(CopilotTransport::OfficialCli) => true,
+            Ok(CopilotTransport::Native) => copilot_auth::has_copilot_credentials(),
+            Err(_) => false,
+        }
     }
 
     fn env_premium_mode() -> u8 {
@@ -195,27 +276,17 @@ impl CopilotApiProvider {
     }
 
     pub fn new_with_token(github_token: String) -> Self {
-        let model =
-            std::env::var("JCODE_COPILOT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-
-        let provider = Self {
+        Self::common(CopilotBackend::Native {
             client: jcode_provider_core::shared_http_client(),
-            model: Arc::new(RwLock::new(model)),
             github_token,
             bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
-            fetched_models: Arc::new(RwLock::new(Vec::new())),
-            catalog_source: Arc::new(RwLock::new(CatalogSource::None)),
             session_id: Uuid::new_v4().to_string(),
             machine_id: Self::get_or_create_machine_id(),
-            init_ready: Arc::new(tokio::sync::Notify::new()),
-            init_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(Self::env_premium_mode())),
-            user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            reasoning_effort: Arc::new(RwLock::new(None)),
-            created_at: std::time::Instant::now(),
-        };
-        provider.seed_cached_catalog();
-        provider
+        })
+    }
+
+    pub fn with_official_process(process: CopilotOfficialCliProcess) -> Self {
+        Self::common(CopilotBackend::OfficialCli { process })
     }
 
     fn startup_prefetch_grace_ms() -> u64 {
@@ -314,6 +385,19 @@ impl CopilotApiProvider {
     /// Call this after construction. Fetches a bearer token and queries /models.
     /// If JCODE_COPILOT_MODEL is set, this is a no-op (user override).
     pub async fn detect_tier_and_set_default(&self) {
+        if matches!(self.backend.transport(), CopilotTransport::OfficialCli) {
+            if let Err(error) = self.probe_official_cli().await {
+                jcode_base::logging::warn(&format!(
+                    "Official Copilot CLI ACP handshake failed: {error:#}"
+                ));
+            }
+            self.mark_init_done();
+            return;
+        }
+        let CopilotBackend::Native { client, .. } = &self.backend else {
+            unreachable!("official transport returned above");
+        };
+
         let detect_start = std::time::Instant::now();
         if std::env::var("JCODE_COPILOT_MODEL").is_ok() {
             jcode_base::logging::info(
@@ -338,7 +422,7 @@ impl CopilotApiProvider {
         };
 
         let fetch_start = std::time::Instant::now();
-        match copilot_auth::fetch_available_models(&self.client, &bearer).await {
+        match copilot_auth::fetch_available_models(client, &bearer).await {
             Ok(models) => {
                 let picker_models: Vec<String> = models
                     .iter()
@@ -393,6 +477,63 @@ impl CopilotApiProvider {
         self.mark_init_done();
     }
 
+    pub async fn probe_official_cli(&self) -> Result<()> {
+        let CopilotBackend::OfficialCli { process } = &self.backend else {
+            bail!("Copilot transport is not official-cli");
+        };
+        let process = process.clone();
+        run_on_acp_thread_with_process(process, |connection, _forward_updates| {
+            Box::pin(async move {
+                initialize_official_cli(&connection).await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn discover_official_models(&self) -> Result<DiscoveredModels> {
+        let CopilotBackend::OfficialCli { process } = &self.backend else {
+            bail!("Copilot transport is not official-cli");
+        };
+        let process = process.clone();
+        run_on_acp_thread_with_process(process, |connection, _forward_updates| {
+            Box::pin(async move {
+                initialize_official_cli(&connection).await?;
+                let cwd =
+                    std::env::current_dir().context("Failed to determine working directory")?;
+                let response = timeout_acp_request(
+                    "session/new",
+                    connection
+                        .new_session(acp::NewSessionRequest::new(cwd).mcp_servers(Vec::new())),
+                )
+                .await?;
+                Ok(models_from_session_state(response.models.as_ref()))
+            })
+        })
+        .await
+    }
+
+    fn update_official_models(&self, discovered: DiscoveredModels) {
+        if !discovered.available.is_empty() {
+            *self
+                .fetched_models
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = discovered.available;
+            *self
+                .catalog_source
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = CatalogSource::Live;
+        }
+        if std::env::var_os("JCODE_COPILOT_MODEL").is_none()
+            && let Some(current) = discovered.current.filter(|model| !model.trim().is_empty())
+        {
+            *self
+                .model
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = current;
+        }
+    }
+
     fn mark_init_done(&self) {
         self.init_done
             .store(true, std::sync::atomic::Ordering::Release);
@@ -417,20 +558,28 @@ impl CopilotApiProvider {
 
     /// Get a valid Copilot bearer token, refreshing if expired
     async fn get_bearer_token(&self) -> Result<String> {
+        let CopilotBackend::Native {
+            client,
+            github_token,
+            bearer_token,
+            ..
+        } = &self.backend
+        else {
+            bail!("Native Copilot bearer tokens are unavailable on official-cli transport");
+        };
         {
-            let guard = self.bearer_token.read().await;
+            let guard = bearer_token.read().await;
             if let Some(ref token) = *guard
                 && !token.is_expired()
             {
                 return Ok(token.token.clone());
             }
         }
-
         // Need to refresh
-        let new_token =
-            copilot_auth::exchange_github_token(&self.client, &self.github_token).await?;
+        // Need to refresh
+        let new_token = copilot_auth::exchange_github_token(client, github_token).await?;
         let token_str = new_token.token.clone();
-        *self.bearer_token.write().await = Some(new_token);
+        *bearer_token.write().await = Some(new_token);
         Ok(token_str)
     }
 
@@ -460,6 +609,25 @@ impl CopilotApiProvider {
         use jcode_message_types::ConnectionPhase;
 
         self.wait_for_init().await;
+        let CopilotBackend::Native {
+            client,
+            bearer_token,
+            session_id,
+            machine_id,
+            ..
+        } = &self.backend
+        else {
+            let _ = tx
+                .send(Err(anyhow!(
+                    "Native Copilot request attempted on official-cli transport"
+                )))
+                .await;
+            return;
+        };
+        let client = client.clone();
+        let bearer_token = Arc::clone(bearer_token);
+        let session_id = session_id.clone();
+        let machine_id = machine_id.clone();
         let model = self
             .model
             .read()
@@ -500,7 +668,7 @@ impl CopilotApiProvider {
                 initiator, model
             ));
 
-            let bearer_token = match self.get_bearer_token().await {
+            let bearer_token_value = match self.get_bearer_token().await {
                 Ok(t) => t,
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
@@ -516,7 +684,7 @@ impl CopilotApiProvider {
             // through the same path, so reusing the shared pool can fail
             // identically. A fresh client guarantees a new TCP+TLS connection.
             let attempt_client = if attempt == 0 {
-                self.client.clone()
+                client.clone()
             } else {
                 jcode_provider_core::fresh_transport_client()
             };
@@ -527,7 +695,7 @@ impl CopilotApiProvider {
                     copilot_auth::COPILOT_API_BASE,
                     copilot_api_path(uses_responses_api)
                 ))
-                .header("Authorization", format!("Bearer {}", bearer_token))
+                .header("Authorization", format!("Bearer {}", bearer_token_value))
                 .header("Editor-Version", copilot_auth::EDITOR_VERSION)
                 .header("Editor-Plugin-Version", copilot_auth::EDITOR_PLUGIN_VERSION)
                 .header(
@@ -540,8 +708,8 @@ impl CopilotApiProvider {
                 .header("Openai-Intent", "conversation-panel")
                 .header("Openai-Organization", "github-copilot")
                 .header("X-GitHub-Api-Version", COPILOT_API_VERSION)
-                .header("Vscode-Sessionid", &self.session_id)
-                .header("Vscode-Machineid", &self.machine_id)
+                .header("Vscode-Sessionid", &session_id)
+                .header("Vscode-Machineid", &machine_id)
                 .json(&body)
                 .send()
                 .await;
@@ -573,7 +741,7 @@ impl CopilotApiProvider {
             // On auth error, invalidate token and retry once
             if Self::is_auth_error(status) && !attempted_auth_refresh {
                 attempted_auth_refresh = true;
-                *self.bearer_token.write().await = None;
+                *bearer_token.write().await = None;
                 jcode_base::logging::info("Copilot bearer token expired, refreshing...");
                 last_error = Some(anyhow::anyhow!("Copilot auth error (HTTP {})", status));
                 continue;
@@ -912,6 +1080,451 @@ impl CopilotApiProvider {
     }
 }
 
+struct CopilotOfficialEventStream {
+    inner: ReceiverStream<Result<StreamEvent>>,
+    cancel: Option<oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stream for CopilotOfficialEventStream {
+    type Item = Result<StreamEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl Drop for CopilotOfficialEventStream {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        // Dropping the child in the ACP thread has kill_on_drop enabled.
+        self.thread.take();
+    }
+}
+
+#[derive(Default, Debug)]
+struct DiscoveredModels {
+    current: Option<String>,
+    available: Vec<String>,
+}
+
+fn models_from_session_state(state: Option<&acp::SessionModelState>) -> DiscoveredModels {
+    let Some(state) = state else {
+        return DiscoveredModels::default();
+    };
+    let current = Some(state.current_model_id.0.to_string());
+    let available = state
+        .available_models
+        .iter()
+        .map(|model| model.model_id.0.to_string())
+        .collect();
+    DiscoveredModels { current, available }
+}
+
+fn build_official_prompt(messages: &[ChatMessage], system: &str, resumed: bool) -> Result<String> {
+    if !resumed
+        && messages
+            .iter()
+            .any(|message| message.role == Role::Assistant)
+    {
+        bail!(
+            "Official Copilot CLI ACP cannot replay disconnected history; resume the provider session instead"
+        );
+    }
+
+    let start = if resumed {
+        messages
+            .iter()
+            .rposition(|message| message.role == Role::Assistant)
+            .map_or(0, |index| index + 1)
+    } else {
+        0
+    };
+
+    let mut sections = Vec::new();
+    if !resumed && !system.trim().is_empty() {
+        sections.push(format!("<system>\n{}\n</system>", system.trim()));
+    }
+    for message in &messages[start..] {
+        if message.role != Role::User {
+            continue;
+        }
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                    sections.push(text.clone());
+                }
+                ContentBlock::ToolResult { content, .. } if !content.trim().is_empty() => {
+                    sections.push(content.clone());
+                }
+                ContentBlock::Image { .. } => {
+                    bail!("Image input is not supported by the official-cli ACP transport");
+                }
+                _ => {}
+            }
+        }
+    }
+    if sections.is_empty() {
+        bail!("No user prompt found for official Copilot CLI request");
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn run_official_turn_thread(
+    process: CopilotOfficialCliProcess,
+    selected_model: String,
+    resume_session_id: Option<String>,
+    prompt: String,
+    allow_permissions: bool,
+    tx: mpsc::Sender<Result<StreamEvent>>,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build official Copilot CLI ACP Tokio runtime")?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
+        tx.send(Ok(StreamEvent::ConnectionType {
+            connection: format!("official-cli ACP ({selected_model})"),
+        }))
+        .await
+        .map_err(|_| anyhow!("Official Copilot CLI stream consumer closed"))?;
+
+        with_official_connection(
+            process,
+            allow_permissions,
+            tx.clone(),
+            async move |connection, forward_updates| {
+                let initialized = initialize_official_cli(&connection).await?;
+                let cwd =
+                    std::env::current_dir().context("Failed to determine working directory")?;
+                let (session_id, session_model) =
+                    if let Some(session_id) = resume_session_id {
+                        if !initialized.agent_capabilities.load_session {
+                            bail!(
+                                "Official Copilot CLI does not advertise ACP session/load support"
+                            );
+                        }
+                        let response = timeout_acp_request(
+                            "session/load",
+                            connection.load_session(
+                                acp::LoadSessionRequest::new(session_id.clone(), cwd)
+                                    .mcp_servers(Vec::new()),
+                            ),
+                        )
+                        .await?;
+                        (
+                            acp::SessionId::new(session_id),
+                            response.models,
+                        )
+                    } else {
+                        let response = timeout_acp_request(
+                            "session/new",
+                            connection.new_session(
+                                acp::NewSessionRequest::new(cwd).mcp_servers(Vec::new()),
+                            ),
+                        )
+                        .await?;
+                        (response.session_id, response.models)
+                    };
+
+                tx.send(Ok(StreamEvent::SessionId(session_id.0.to_string())))
+                    .await
+                    .map_err(|_| anyhow!("Official Copilot CLI stream consumer closed"))?;
+
+                let current_model = session_model
+                    .as_ref()
+                    .map(|models| models.current_model_id.0.as_ref());
+                if current_model != Some(selected_model.as_str()) {
+                    timeout_acp_request(
+                        "session/set_model",
+                        connection.set_session_model(acp::SetSessionModelRequest::new(
+                            session_id.clone(),
+                            selected_model,
+                        )),
+                    )
+                    .await?;
+                }
+
+                forward_updates.store(true, Ordering::Release);
+                let prompt_request = acp::PromptRequest::new(
+                    session_id.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                );
+                tokio::pin!(cancel_rx);
+                let response = tokio::select! {
+                    response = tokio::time::timeout(ACP_PROMPT_TIMEOUT, connection.prompt(prompt_request)) => {
+                        response
+                            .map_err(|_| anyhow!("Official Copilot CLI ACP session/prompt timed out after {}s", ACP_PROMPT_TIMEOUT.as_secs()))?
+                            .map_err(|error| anyhow!("Official Copilot CLI ACP session/prompt failed: {error}"))?
+                    }
+                    _ = &mut cancel_rx => {
+                        connection.cancel(acp::CancelNotification::new(session_id.clone())).await
+                            .map_err(|error| anyhow!("Failed to cancel official Copilot CLI ACP prompt: {error}"))?;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        return Ok(());
+                    }
+                };
+
+                if let Some(usage) = response.usage {
+                    tx.send(Ok(StreamEvent::TokenUsage {
+                        input_tokens: Some(usage.input_tokens),
+                        output_tokens: Some(usage.output_tokens),
+                        cache_read_input_tokens: usage.cached_read_tokens,
+                        cache_creation_input_tokens: usage.cached_write_tokens,
+                    }))
+                    .await
+                    .map_err(|_| anyhow!("Official Copilot CLI stream consumer closed"))?;
+                }
+                tx.send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some(acp_stop_reason(response.stop_reason).to_string()),
+                }))
+                .await
+                .map_err(|_| anyhow!("Official Copilot CLI stream consumer closed"))?;
+                Ok(())
+            },
+        )
+        .await
+    })
+}
+
+fn acp_stop_reason(reason: acp::StopReason) -> &'static str {
+    match reason {
+        acp::StopReason::EndTurn => "end_turn",
+        acp::StopReason::MaxTokens => "max_tokens",
+        acp::StopReason::MaxTurnRequests => "max_turn_requests",
+        acp::StopReason::Refusal => "refusal",
+        acp::StopReason::Cancelled => "cancelled",
+        _ => "unknown",
+    }
+}
+
+async fn initialize_official_cli(
+    connection: &acp::ClientSideConnection,
+) -> Result<acp::InitializeResponse> {
+    let initialize = acp::InitializeRequest::new(acp::ProtocolVersion::V1)
+        .client_info(acp::Implementation::new("jcode", env!("CARGO_PKG_VERSION")).title("Jcode"));
+    let response = timeout_acp_request("initialize", connection.initialize(initialize)).await?;
+    if response.protocol_version != acp::ProtocolVersion::V1 {
+        bail!(
+            "Official Copilot CLI negotiated unsupported ACP protocol version {:?}",
+            response.protocol_version
+        );
+    }
+    // Authentication remains entirely owned by the official CLI. In
+    // particular, do not call ACP authenticate even when the CLI advertises
+    // its interactive login method.
+    Ok(response)
+}
+
+async fn timeout_acp_request<T>(
+    name: &'static str,
+    future: impl std::future::Future<Output = acp::Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(ACP_REQUEST_TIMEOUT, future)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "Official Copilot CLI ACP {name} timed out after {}s",
+                ACP_REQUEST_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|error| anyhow!("Official Copilot CLI ACP {name} failed: {error}"))
+}
+
+type LocalConnectionFuture<T> = Pin<Box<dyn std::future::Future<Output = Result<T>> + 'static>>;
+
+async fn run_on_acp_thread_with_process<T: Send + 'static>(
+    process: CopilotOfficialCliProcess,
+    operation: impl FnOnce(acp::ClientSideConnection, Arc<AtomicBool>) -> LocalConnectionFuture<T>
+    + Send
+    + 'static,
+) -> Result<T> {
+    let (result_tx, result_rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("jcode-copilot-official-acp-probe".to_string())
+        .spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&runtime, async move {
+                    with_official_connection(process, false, mpsc::channel(1).0, operation).await
+                })
+            })();
+            let _ = result_tx.send(result);
+        })
+        .context("Failed to start official Copilot CLI ACP probe thread")?;
+    result_rx
+        .await
+        .context("Official Copilot CLI ACP probe thread exited without a result")?
+}
+
+async fn with_official_connection<T, F, Fut>(
+    process: CopilotOfficialCliProcess,
+    allow_permissions: bool,
+    event_tx: mpsc::Sender<Result<StreamEvent>>,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce(acp::ClientSideConnection, Arc<AtomicBool>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>> + 'static,
+{
+    let mut command = Command::new(&process.command);
+    command
+        .args(&process.args)
+        .envs(&process.env)
+        // The user's interactive Copilot wrapper may set this globally. Jcode
+        // answers ACP permission requests itself and must not inherit an
+        // environment-level approve-all override.
+        .env_remove("COPILOT_ALLOW_ALL")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Failed to launch official Copilot CLI at '{}'",
+            process.command.display()
+        )
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("Official Copilot CLI stdin was unavailable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Official Copilot CLI stdout was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Official Copilot CLI stderr was unavailable")?;
+    let stderr_capture = Arc::new(std::sync::Mutex::new(String::new()));
+    let mut stderr_task =
+        tokio::task::spawn_local(capture_stderr(stderr, Arc::clone(&stderr_capture)));
+
+    let forward_updates = Arc::new(AtomicBool::new(false));
+    let client = CopilotAcpClient {
+        tx: event_tx,
+        forward_updates: Arc::clone(&forward_updates),
+        allow_permissions,
+    };
+    let (connection, io) =
+        acp::ClientSideConnection::new(client, stdin.compat_write(), stdout.compat(), |future| {
+            tokio::task::spawn_local(future);
+        });
+    let io_task = tokio::task::spawn_local(io);
+    let result = operation(connection, forward_updates).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    io_task.abort();
+    let _ = tokio::time::timeout(Duration::from_millis(100), &mut stderr_task).await;
+    stderr_task.abort();
+    let stderr = stderr_capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .trim()
+        .to_string();
+    result.map_err(|error| {
+        if stderr.is_empty() {
+            error
+        } else {
+            error.context(format!("Official Copilot CLI stderr: {stderr}"))
+        }
+    })
+}
+
+async fn capture_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    capture: Arc<std::sync::Mutex<String>>,
+) {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let Ok(read) = stderr.read(&mut buffer).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        let mut output = capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if output.len() < STDERR_LIMIT {
+            let remaining = STDERR_LIMIT - output.len();
+            output.push_str(&String::from_utf8_lossy(&buffer[..read.min(remaining)]));
+        }
+    }
+}
+
+struct CopilotAcpClient {
+    tx: mpsc::Sender<Result<StreamEvent>>,
+    forward_updates: Arc<AtomicBool>,
+    allow_permissions: bool,
+}
+
+#[async_trait(?Send)]
+impl acp::Client for CopilotAcpClient {
+    async fn request_permission(
+        &self,
+        request: acp::RequestPermissionRequest,
+    ) -> acp::Result<acp::RequestPermissionResponse> {
+        let selected = self.allow_permissions.then(|| {
+            request
+                .options
+                .iter()
+                .find(|option| option.kind == acp::PermissionOptionKind::AllowOnce)
+        });
+        let outcome = match selected.flatten() {
+            Some(option) => acp::RequestPermissionOutcome::Selected(
+                acp::SelectedPermissionOutcome::new(option.option_id.clone()),
+            ),
+            None => acp::RequestPermissionOutcome::Cancelled,
+        };
+        Ok(acp::RequestPermissionResponse::new(outcome))
+    }
+
+    async fn session_notification(
+        &self,
+        notification: acp::SessionNotification,
+    ) -> acp::Result<()> {
+        if !self.forward_updates.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let event = match notification.update {
+            acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                text_from_acp_content(chunk.content).map(StreamEvent::TextDelta)
+            }
+            acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                text_from_acp_content(chunk.content).map(StreamEvent::ThinkingDelta)
+            }
+            acp::SessionUpdate::ToolCall(call) => {
+                Some(StreamEvent::StatusDetail { detail: call.title })
+            }
+            acp::SessionUpdate::ToolCallUpdate(update) => update
+                .fields
+                .title
+                .map(|detail| StreamEvent::StatusDetail { detail }),
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = self.tx.send(Ok(event)).await;
+        }
+        Ok(())
+    }
+}
+
+fn text_from_acp_content(content: acp::ContentBlock) -> Option<String> {
+    match content {
+        acp::ContentBlock::Text(text) => Some(text.text),
+        _ => None,
+    }
+}
+
 fn is_retryable_error(error_str: &str) -> bool {
     jcode_provider_core::is_transient_transport_error(error_str)
         || error_str.contains("500 internal server error")
@@ -933,15 +1546,45 @@ impl Provider for CopilotApiProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
         system: &str,
-        _resume_session_id: Option<&str>,
+        resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
         self.wait_for_init().await;
 
+        if let CopilotBackend::OfficialCli { process } = &self.backend {
+            let prompt = build_official_prompt(messages, system, resume_session_id.is_some())?;
+            let process = process.clone();
+            let selected_model = self.model();
+            let resume_session_id = resume_session_id.map(ToOwned::to_owned);
+            let allow_permissions = !tools.is_empty();
+            let (tx, rx) = mpsc::channel(128);
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+
+            let thread = std::thread::Builder::new()
+                .name("jcode-copilot-official-acp".to_string())
+                .spawn(move || {
+                    if let Err(error) = run_official_turn_thread(
+                        process,
+                        selected_model,
+                        resume_session_id,
+                        prompt,
+                        allow_permissions,
+                        tx.clone(),
+                        cancel_rx,
+                    ) {
+                        let _ = tx.blocking_send(Err(error));
+                    }
+                })
+                .context("Failed to start official Copilot CLI ACP runtime thread")?;
+
+            return Ok(Box::pin(CopilotOfficialEventStream {
+                inner: ReceiverStream::new(rx),
+                cancel: Some(cancel_tx),
+                thread: Some(thread),
+            }));
+        }
+
         self.get_bearer_token().await.map_err(|e| {
-            jcode_base::logging::warn(&format!(
-                "Copilot bearer token acquisition failed (will trigger fallback): {}",
-                e
-            ));
+            jcode_base::logging::warn(&format!("Copilot bearer token acquisition failed: {}", e,));
             e
         })?;
 
@@ -1019,14 +1662,10 @@ impl Provider for CopilotApiProvider {
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
 
         let provider = CopilotApiProvider {
-            client: self.client.clone(),
+            backend: self.backend.clone(),
             model: self.model.clone(),
-            github_token: self.github_token.clone(),
-            bearer_token: self.bearer_token.clone(),
             fetched_models: self.fetched_models.clone(),
             catalog_source: self.catalog_source.clone(),
-            session_id: self.session_id.clone(),
-            machine_id: self.machine_id.clone(),
             init_ready: self.init_ready.clone(),
             init_done: self.init_done.clone(),
             premium_mode: self.premium_mode.clone(),
@@ -1098,6 +1737,11 @@ impl Provider for CopilotApiProvider {
     }
 
     async fn prefetch_models(&self) -> Result<()> {
+        if matches!(self.backend.transport(), CopilotTransport::OfficialCli) {
+            let discovered = self.discover_official_models().await?;
+            self.update_official_models(discovered);
+            return Ok(());
+        }
         let grace_ms = Self::startup_prefetch_grace_ms();
         if self.created_at.elapsed().as_millis() < u128::from(grace_ms) {
             jcode_base::logging::info(&format!(
@@ -1111,7 +1755,7 @@ impl Provider for CopilotApiProvider {
     }
 
     fn supports_compaction(&self) -> bool {
-        true
+        matches!(self.backend.transport(), CopilotTransport::Native)
     }
 
     fn model_catalog_detail(&self) -> String {
@@ -1133,14 +1777,10 @@ impl Provider for CopilotApiProvider {
 
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(CopilotApiProvider {
-            client: self.client.clone(),
+            backend: self.backend.clone(),
             model: Arc::new(RwLock::new(self.model())),
-            github_token: self.github_token.clone(),
-            bearer_token: self.bearer_token.clone(),
             fetched_models: self.fetched_models.clone(),
             catalog_source: self.catalog_source.clone(),
-            session_id: self.session_id.clone(),
-            machine_id: self.machine_id.clone(),
             init_ready: self.init_ready.clone(),
             init_done: self.init_done.clone(),
             premium_mode: self.premium_mode.clone(),
@@ -1151,6 +1791,9 @@ impl Provider for CopilotApiProvider {
     }
 
     fn reasoning_effort(&self) -> Option<String> {
+        if matches!(self.backend.transport(), CopilotTransport::OfficialCli) {
+            return None;
+        }
         if !copilot_model_supports_reasoning_effort(&self.model()) {
             return None;
         }
@@ -1158,6 +1801,9 @@ impl Provider for CopilotApiProvider {
     }
 
     fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
+        if matches!(self.backend.transport(), CopilotTransport::OfficialCli) {
+            bail!("Reasoning effort selection is not supported by the official-cli ACP transport");
+        }
         let model = self.model();
         if !copilot_model_supports_reasoning_effort(&model) {
             anyhow::bail!(
@@ -1182,11 +1828,46 @@ impl Provider for CopilotApiProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
+        if matches!(self.backend.transport(), CopilotTransport::OfficialCli) {
+            return vec![];
+        }
         if copilot_model_supports_reasoning_effort(&self.model()) {
             SONNET5_EFFORTS.to_vec()
         } else {
             vec![]
         }
+    }
+
+    fn active_auth_method_label(&self) -> Option<&'static str> {
+        match self.backend.transport() {
+            CopilotTransport::Native => Some("GitHub OAuth token exchange"),
+            CopilotTransport::OfficialCli => Some("Official Copilot CLI"),
+        }
+    }
+
+    fn handles_tools_internally(&self) -> bool {
+        matches!(self.backend.transport(), CopilotTransport::OfficialCli)
+    }
+
+    fn transport(&self) -> Option<String> {
+        Some(self.backend.transport().as_str().to_string())
+    }
+
+    fn set_transport(&self, transport: &str) -> Result<()> {
+        let requested = CopilotTransport::parse(Some(transport)).map_err(anyhow::Error::msg)?;
+        let current = self.backend.transport();
+        if requested == current {
+            return Ok(());
+        }
+        bail!(
+            "Copilot transport is fixed at construction ({}); set JCODE_COPILOT_TRANSPORT={} and restart jcode",
+            current.as_str(),
+            requested.as_str()
+        )
+    }
+
+    fn available_transports(&self) -> Vec<&'static str> {
+        vec!["native", "official-cli"]
     }
 }
 

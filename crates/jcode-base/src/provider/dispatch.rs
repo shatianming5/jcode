@@ -101,9 +101,7 @@ impl MultiProvider {
                         .complete(messages, tools, system, resume_session_id)
                         .await
                 } else {
-                    Err(anyhow::anyhow!(
-                        "GitHub Copilot is not available. Run `jcode login --provider copilot`."
-                    ))
+                    Err(anyhow::anyhow!(copilot::unavailable_message()))
                 }
             }
             ActiveProvider::Antigravity => {
@@ -248,9 +246,7 @@ impl MultiProvider {
                         )
                         .await
                 } else {
-                    Err(anyhow::anyhow!(
-                        "GitHub Copilot is not available. Run `jcode login --provider copilot`."
-                    ))
+                    Err(anyhow::anyhow!(copilot::unavailable_message()))
                 }
             }
             ActiveProvider::Antigravity => {

@@ -2,14 +2,16 @@ use super::*;
 
 fn make_test_provider(fetched: Vec<String>) -> CopilotApiProvider {
     CopilotApiProvider {
-        client: jcode_base::provider::shared_http_client(),
+        backend: CopilotBackend::Native {
+            client: jcode_base::provider::shared_http_client(),
+            github_token: "test-token".to_string(),
+            bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
+            session_id: "test-session".to_string(),
+            machine_id: "test-machine".to_string(),
+        },
         model: Arc::new(RwLock::new(DEFAULT_MODEL.to_string())),
-        github_token: "test-token".to_string(),
-        bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
         fetched_models: Arc::new(RwLock::new(fetched)),
         catalog_source: Arc::new(RwLock::new(CatalogSource::Live)),
-        session_id: "test-session".to_string(),
-        machine_id: "test-machine".to_string(),
         init_ready: Arc::new(tokio::sync::Notify::new()),
         init_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -17,6 +19,30 @@ fn make_test_provider(fetched: Vec<String>) -> CopilotApiProvider {
         reasoning_effort: Arc::new(RwLock::new(None)),
         created_at: std::time::Instant::now(),
     }
+}
+
+#[test]
+fn native_transport_regression_and_construction_lock() {
+    let provider = make_test_provider(Vec::new());
+    assert_eq!(provider.transport().as_deref(), Some("native"));
+    assert_eq!(
+        provider.available_transports(),
+        vec!["native", "official-cli"]
+    );
+    assert!(provider.set_transport("native").is_ok());
+    assert!(provider.set_transport("official-cli").is_err());
+    assert!(!provider.handles_tools_internally());
+}
+
+#[test]
+fn official_transport_reports_internal_tool_handling() {
+    let provider = CopilotApiProvider::with_official_process(
+        CopilotOfficialCliProcess::with_command(PathBuf::from("copilot")),
+    );
+    assert_eq!(provider.transport().as_deref(), Some("official-cli"));
+    assert!(provider.handles_tools_internally());
+    assert!(!provider.supports_compaction());
+    assert!(provider.set_reasoning_effort("high").is_err());
 }
 
 #[test]

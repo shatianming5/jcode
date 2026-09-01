@@ -253,6 +253,21 @@ fn model_smoke_readiness_for_provider(provider: LoginProviderDescriptor) -> Auth
 }
 
 fn copilot_auth_state_from_credentials() -> (AuthState, bool) {
+    match crate::provider::copilot::selected_transport() {
+        Ok(crate::provider::copilot::CopilotTransport::OfficialCli) => {
+            return (
+                if crate::provider::copilot::official_cli_configured() {
+                    AuthState::Available
+                } else {
+                    AuthState::Expired
+                },
+                false,
+            );
+        }
+        Err(_) => return (AuthState::Expired, false),
+        Ok(crate::provider::copilot::CopilotTransport::Native) => {}
+    }
+
     if !copilot::has_copilot_credentials_fast() {
         return (AuthState::NotConfigured, false);
     }
@@ -1261,16 +1276,27 @@ fn assessment_for_key(
         }
         LoginProviderAuthStateKey::Copilot => {
             let (source, detail) = summarize_sources(vec![copilot_source()]);
+            let official_cli = crate::provider::copilot::official_cli_selected();
             (
                 source,
                 detail,
-                if state == AuthState::Available {
+                if official_cli {
+                    AuthExpiryConfidence::NotApplicable
+                } else if state == AuthState::Available {
                     AuthExpiryConfidence::PresenceOnly
                 } else {
                     AuthExpiryConfidence::Unknown
                 },
-                AuthRefreshSupport::ManualRelogin,
-                AuthValidationMethod::CompositeProbe,
+                if official_cli {
+                    AuthRefreshSupport::ExternalManaged
+                } else {
+                    AuthRefreshSupport::ManualRelogin
+                },
+                if official_cli {
+                    AuthValidationMethod::CommandProbe
+                } else {
+                    AuthValidationMethod::CompositeProbe
+                },
             )
         }
         LoginProviderAuthStateKey::Antigravity => {
@@ -1587,6 +1613,25 @@ fn cursor_source() -> Option<(AuthCredentialSource, String)> {
 }
 
 fn copilot_source() -> Option<(AuthCredentialSource, String)> {
+    match crate::provider::copilot::selected_transport() {
+        Ok(crate::provider::copilot::CopilotTransport::OfficialCli) => {
+            return Some((
+                AuthCredentialSource::LocalCliSession,
+                match crate::provider::copilot::official_cli_path_from_env() {
+                    Ok(path) => format!(
+                        "official Copilot CLI inherited process environment ({})",
+                        path.display()
+                    ),
+                    Err(error) => error,
+                },
+            ));
+        }
+        Err(error) => {
+            return Some((AuthCredentialSource::AppConfigFile, error.to_string()));
+        }
+        Ok(crate::provider::copilot::CopilotTransport::Native) => {}
+    }
+
     if env_var_nonempty("COPILOT_GITHUB_TOKEN")
         || env_var_nonempty("GH_TOKEN")
         || env_var_nonempty("GITHUB_TOKEN")

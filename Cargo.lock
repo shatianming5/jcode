@@ -3606,6 +3606,7 @@ dependencies = [
 name = "jcode-provider-copilot-runtime"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "async-trait",
  "chrono",
@@ -3621,6 +3622,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "uuid",
 ]
 

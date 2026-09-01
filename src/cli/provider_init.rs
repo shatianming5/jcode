@@ -669,7 +669,8 @@ async fn detect_auto_provider_flags() -> AutoProviderAvailability {
     AutoProviderAvailability {
         has_claude: auth_status.anthropic.has_oauth || auth_status.anthropic.has_api_key,
         has_openai: auth_status.openai_has_oauth || auth_status.openai_has_api_key,
-        has_copilot: auth_status.copilot_has_api_token,
+        has_copilot: auth_status.copilot_has_api_token
+            || provider::copilot::official_cli_configured(),
         has_antigravity: auth::antigravity::load_tokens().is_ok(),
         has_gemini: auth_status.gemini == auth::AuthState::Available,
         has_cursor: auth_status.cursor == auth::AuthState::Available,
@@ -1116,6 +1117,13 @@ fn ensure_antigravity_auth_allowed_for_explicit_choice() -> Result<()> {
 }
 
 fn ensure_copilot_auth_allowed_for_explicit_choice() -> Result<()> {
+    match provider::copilot::selected_transport()? {
+        provider::copilot::CopilotTransport::OfficialCli => {
+            jcode_provider_copilot_runtime::CopilotOfficialCliProcess::from_env()?;
+            return Ok(());
+        }
+        provider::copilot::CopilotTransport::Native => {}
+    }
     if auth::copilot::load_github_token().is_ok() {
         return Ok(());
     }
@@ -1141,6 +1149,14 @@ fn ensure_copilot_auth_allowed_for_explicit_choice() -> Result<()> {
 }
 
 fn maybe_enable_copilot_auth_for_auto(has_other_provider: bool) -> Result<bool> {
+    match provider::copilot::selected_transport()? {
+        provider::copilot::CopilotTransport::OfficialCli => {
+            return Ok(
+                jcode_provider_copilot_runtime::CopilotOfficialCliProcess::from_env().is_ok(),
+            );
+        }
+        provider::copilot::CopilotTransport::Native => {}
+    }
     if auth::copilot::load_github_token().is_ok() {
         return Ok(true);
     }
@@ -1513,7 +1529,10 @@ async fn init_provider_with_options(
         ProviderChoice::Copilot => {
             disable_subscription_runtime_mode();
             ensure_copilot_auth_allowed_for_explicit_choice()?;
-            init_notice("Using GitHub Copilot API as the initial provider (use /model to switch)");
+            let transport = provider::copilot::selected_transport()?.as_str();
+            init_notice(&format!(
+                "Using GitHub Copilot as the initial provider (transport: {transport}; use /model to switch)"
+            ));
             select_initial_model_provider("copilot");
             Arc::new(provider::MultiProvider::new_fast())
         }
