@@ -561,67 +561,78 @@ pub(super) async fn fetch_cursor_usage_report() -> Option<ProviderUsage> {
 }
 
 pub(super) async fn fetch_copilot_usage_report() -> Option<ProviderUsage> {
-    if !auth::copilot::has_copilot_credentials() {
-        return None;
-    }
-
-    let github_token = auth::copilot::load_github_token().ok()?;
-
     let mut limits = Vec::new();
     let mut extra_info = Vec::new();
 
-    // Fetch plan/quota info from the token endpoint
-    let client = crate::provider::shared_http_client();
-    let api_result = client
-        .get(auth::copilot::COPILOT_TOKEN_URL)
-        .header("Authorization", format!("token {}", github_token))
-        .header("User-Agent", auth::copilot::EDITOR_VERSION)
-        .header("Editor-Version", auth::copilot::EDITOR_VERSION)
-        .header(
-            "Editor-Plugin-Version",
-            auth::copilot::EDITOR_PLUGIN_VERSION,
-        )
-        .header("Accept", "application/json")
-        .send()
-        .await;
-
-    if let Ok(resp) = api_result
-        && resp.status().is_success()
-        && let Ok(json) = resp.json::<serde_json::Value>().await
-    {
-        if let Some(sku) = json.get("sku").and_then(|v| v.as_str()) {
-            extra_info.push(("Plan".to_string(), sku.to_string()));
+    match crate::provider::copilot::selected_transport().ok()? {
+        crate::provider::copilot::CopilotTransport::OfficialCli => {
+            if !crate::provider::copilot::official_cli_configured() {
+                return None;
+            }
+            extra_info.push((
+                "Remote quota".to_string(),
+                "Unsupported for official-cli transport; authentication and quota are CLI-managed."
+                    .to_string(),
+            ));
         }
+        crate::provider::copilot::CopilotTransport::Native => {
+            if !auth::copilot::has_copilot_credentials() {
+                return None;
+            }
+            let github_token = auth::copilot::load_github_token().ok()?;
+            let client = crate::provider::shared_http_client();
+            let api_result = client
+                .get(auth::copilot::COPILOT_TOKEN_URL)
+                .header("Authorization", format!("token {}", github_token))
+                .header("User-Agent", auth::copilot::EDITOR_VERSION)
+                .header("Editor-Version", auth::copilot::EDITOR_VERSION)
+                .header(
+                    "Editor-Plugin-Version",
+                    auth::copilot::EDITOR_PLUGIN_VERSION,
+                )
+                .header("Accept", "application/json")
+                .send()
+                .await;
 
-        let reset_date = json
-            .get("limited_user_reset_date")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            if let Ok(resp) = api_result
+                && resp.status().is_success()
+                && let Ok(json) = resp.json::<serde_json::Value>().await
+            {
+                if let Some(sku) = json.get("sku").and_then(|v| v.as_str()) {
+                    extra_info.push(("Plan".to_string(), sku.to_string()));
+                }
 
-        if let Some(quotas) = json.get("limited_user_quotas").and_then(|v| v.as_object()) {
-            for (name, value) in quotas {
-                if let Some(obj) = value.as_object() {
-                    let used = obj.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let limit = obj.get("limit").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if limit > 0.0 {
-                        let pct = usage_percent_from_used_limit(used, limit);
-                        limits.push(UsageLimit {
-                            name: format!("{} (remote)", humanize_key(name)),
-                            usage_percent: pct,
-                            resets_at: reset_date.clone(),
-                        });
-                        extra_info.push((
-                            humanize_key(name),
-                            format!("{} / {} used", used as u64, limit as u64),
-                        ));
+                let reset_date = json
+                    .get("limited_user_reset_date")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(quotas) = json.get("limited_user_quotas").and_then(|v| v.as_object()) {
+                    for (name, value) in quotas {
+                        if let Some(obj) = value.as_object() {
+                            let used = obj.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let limit = obj.get("limit").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            if limit > 0.0 {
+                                let pct = usage_percent_from_used_limit(used, limit);
+                                limits.push(UsageLimit {
+                                    name: format!("{} (remote)", humanize_key(name)),
+                                    usage_percent: pct,
+                                    resets_at: reset_date.clone(),
+                                });
+                                extra_info.push((
+                                    humanize_key(name),
+                                    format!("{} / {} used", used as u64, limit as u64),
+                                ));
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        if let Some(ref rd) = reset_date {
-            let relative = crate::usage::format_reset_time(rd);
-            extra_info.push(("Resets in".to_string(), relative));
+                if let Some(ref rd) = reset_date {
+                    let relative = crate::usage::format_reset_time(rd);
+                    extra_info.push(("Resets in".to_string(), relative));
+                }
+            }
         }
     }
 

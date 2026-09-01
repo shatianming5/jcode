@@ -114,6 +114,28 @@ impl Provider for JcodeProvider {
             .await
     }
 
+    async fn complete_split_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_static: &str,
+        system_dynamic: &str,
+        resume_session_id: Option<&str>,
+        request_context: &super::ProviderRequestContext,
+    ) -> Result<EventStream> {
+        self.ensure_runtime_mode();
+        self.inner
+            .complete_split_with_context(
+                messages,
+                tools,
+                system_static,
+                system_dynamic,
+                resume_session_id,
+                request_context,
+            )
+            .await
+    }
+
     fn name(&self) -> &str {
         crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME
     }

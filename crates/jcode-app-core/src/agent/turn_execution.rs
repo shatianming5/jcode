@@ -15,6 +15,7 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
+
         let _ = self.run_turn(true).await?;
         Ok(())
     }
@@ -224,6 +225,23 @@ impl Agent {
         self.persist_session_best_effort("provider session reset");
     }
 
+    pub(crate) fn model_switch_session_key(&self) -> Option<&'static str> {
+        self.provider.model_switch_session_key()
+    }
+
+    pub(crate) fn reconcile_provider_session_after_model_switch(
+        &mut self,
+        previous_key: Option<&'static str>,
+    ) -> &'static str {
+        let current_key = self.provider.model_switch_session_key();
+        if previous_key.is_some() && previous_key == current_key {
+            "preserved"
+        } else {
+            self.reset_provider_session();
+            "reset"
+        }
+    }
+
     /// Rewind the conversation to a 1-based visible transcript message index.
     ///
     /// The index is interpreted against the same rendered transcript the TUI
@@ -243,6 +261,12 @@ impl Agent {
                 "Invalid message number: {}. Valid range: 1-{}",
                 message_index, message_count
             ));
+        }
+        if !self.provider.supports_conversation_rewind() {
+            return Err(
+                "Conversation rewind is not supported by the official Copilot CLI transport because ACP cannot rebuild a truncated upstream session."
+                    .to_string(),
+            );
         }
         let stored_len = targets[message_index - 1] + 1;
 

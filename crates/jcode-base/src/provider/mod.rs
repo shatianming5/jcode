@@ -58,8 +58,8 @@ pub use jcode_provider_core::{
     CHEAPNESS_REFERENCE_OUTPUT_TOKENS, CredentialMode, DEFAULT_CONTEXT_LIMIT, EventStream,
     JCODE_USER_AGENT, ModelCapabilities, ModelCatalogRefreshSummary, ModelRoute,
     ModelRouteApiMethod, NativeCompactionResult, NativeToolResult, NativeToolResultSender,
-    PremiumMode, Provider, RouteBillingKind, RouteCheapnessEstimate, RouteCostConfidence,
-    RouteCostSource, RouteSelection, RuntimeKey, dedupe_model_routes,
+    PremiumMode, Provider, ProviderRequestContext, RouteBillingKind, RouteCheapnessEstimate,
+    RouteCostConfidence, RouteCostSource, RouteSelection, RuntimeKey, dedupe_model_routes,
     explicit_model_provider_prefix, fresh_transport_client, inferred_reasoning_efforts,
     model_name_for_provider, normalize_copilot_model_name, provider_from_model_key,
     shared_http_client, summarize_model_catalog_refresh,
@@ -612,6 +612,7 @@ impl MultiProvider {
         tools: &[ToolDefinition],
         mode: CompletionMode<'_>,
         resume_session_id: Option<&str>,
+        request_context: Option<&ProviderRequestContext>,
     ) -> Result<EventStream> {
         self.spawn_anthropic_catalog_refresh_if_needed();
         self.spawn_openai_catalog_refresh_if_needed();
@@ -714,6 +715,7 @@ impl MultiProvider {
                         system_static,
                         system_dynamic,
                         resume_session_id,
+                        request_context,
                     )
                     .await
                 }
@@ -1728,6 +1730,7 @@ impl Provider for MultiProvider {
             tools,
             CompletionMode::Unified { system },
             resume_session_id,
+            None,
         )
         .await
     }
@@ -1749,6 +1752,29 @@ impl Provider for MultiProvider {
                 system_dynamic,
             },
             resume_session_id,
+            None,
+        )
+        .await
+    }
+
+    async fn complete_split_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_static: &str,
+        system_dynamic: &str,
+        resume_session_id: Option<&str>,
+        request_context: &ProviderRequestContext,
+    ) -> Result<EventStream> {
+        self.complete_with_failover(
+            messages,
+            tools,
+            CompletionMode::Split {
+                system_static,
+                system_dynamic,
+            },
+            resume_session_id,
+            Some(request_context),
         )
         .await
     }
@@ -1777,6 +1803,24 @@ impl Provider for MultiProvider {
             return execution.runtime_display_name();
         }
         self.name().to_string()
+    }
+
+    fn model_switch_session_key(&self) -> Option<&'static str> {
+        match self.active_provider() {
+            ActiveProvider::Copilot => self
+                .copilot_provider()
+                .and_then(|provider| provider.model_switch_session_key()),
+            _ => None,
+        }
+    }
+
+    fn supports_conversation_rewind(&self) -> bool {
+        match self.active_provider() {
+            ActiveProvider::Copilot => self
+                .copilot_provider()
+                .is_none_or(|provider| provider.supports_conversation_rewind()),
+            _ => true,
+        }
     }
 
     fn model(&self) -> String {

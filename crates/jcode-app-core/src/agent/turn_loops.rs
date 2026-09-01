@@ -144,14 +144,17 @@ impl Agent {
             let send_messages = stamped.as_deref().unwrap_or(&messages_with_memory);
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
+            let request_context =
+                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from));
             let mut stream = match self
                 .provider
-                .complete_split(
+                .complete_split_with_context(
                     send_messages,
                     &tools,
                     &split_prompt.static_part,
                     &split_prompt.dynamic_part,
                     self.provider_session_id.as_deref(),
+                    &request_context,
                 )
                 .await
             {

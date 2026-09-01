@@ -14,3 +14,6 @@ include!("auth_test/types.rs");
 include!("auth_test/run.rs");
 include!("auth_test/probes.rs");
 include!("auth_test/choice.rs");
+
+#[cfg(test)]
+mod tests;

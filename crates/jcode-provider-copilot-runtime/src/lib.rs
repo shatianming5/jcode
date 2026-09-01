@@ -13,6 +13,7 @@ use futures::Stream;
 use jcode_base::auth::copilot as copilot_auth;
 use jcode_message_types::{
     ContentBlock, Message as ChatMessage, Role, StreamEvent, ToolDefinition,
+    messages_with_dynamic_system_context,
 };
 #[cfg(test)]
 use jcode_provider_copilot::max_token_parameter_for_model as copilot_max_token_parameter_for_model;
@@ -24,9 +25,9 @@ use jcode_provider_copilot::{
 };
 use jcode_provider_copilot::{DEFAULT_MODEL, FALLBACK_MODELS};
 pub use jcode_provider_core::PremiumMode;
-use jcode_provider_core::{EventStream, Provider};
+use jcode_provider_core::{EventStream, Provider, ProviderRequestContext};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +76,7 @@ impl CopilotOfficialCliProcess {
                 "--log-level".to_string(),
                 "none".to_string(),
                 "--no-custom-instructions".to_string(),
+                "--disable-builtin-mcps".to_string(),
             ],
             env: BTreeMap::new(),
         }
@@ -83,6 +85,89 @@ impl CopilotOfficialCliProcess {
     pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
         self.env = env;
         self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CopilotOfficialToolPolicy {
+    available_tools: BTreeSet<&'static str>,
+    allow_read: bool,
+    allow_search: bool,
+    allow_write: bool,
+    allow_execute: bool,
+    allow_fetch: bool,
+}
+
+impl CopilotOfficialToolPolicy {
+    fn from_jcode_tools(tools: &[ToolDefinition]) -> Self {
+        let mut policy = Self::default();
+        for tool in tools {
+            match tool.name.as_str() {
+                "read" | "view" | "read_file" | "file_read" => {
+                    policy.available_tools.insert("view");
+                    policy.allow_read = true;
+                }
+                "agentgrep" | "grep" | "rg" | "file_grep" => {
+                    policy.available_tools.insert("grep");
+                    policy.available_tools.insert("glob");
+                    policy.allow_read = true;
+                    policy.allow_search = true;
+                }
+                "ls" | "glob" => {
+                    policy.available_tools.insert("glob");
+                    policy.allow_read = true;
+                    policy.allow_search = true;
+                }
+                "bash" | "shell" | "shell_exec" => {
+                    policy.available_tools.insert("bash");
+                    policy.allow_execute = true;
+                }
+                "write" | "write_file" | "file_write" => {
+                    policy.available_tools.insert("create");
+                    policy.allow_write = true;
+                }
+                "edit" | "multiedit" | "edit_file" | "file_edit" => {
+                    policy.available_tools.insert("edit");
+                    policy.allow_write = true;
+                }
+                "patch" | "apply_patch" => {}
+                "webfetch" | "web_fetch" => {
+                    policy.available_tools.insert("web_fetch");
+                    policy.allow_fetch = true;
+                }
+                "websearch" | "web_search" => {}
+                _ => {}
+            }
+        }
+        policy
+    }
+
+    fn configure_command(&self, command: &mut Command) {
+        if self.available_tools.is_empty() {
+            command.arg("--available-tools");
+        } else {
+            command.arg(format!(
+                "--available-tools={}",
+                self.available_tools
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
+
+    fn allows(&self, kind: Option<acp::ToolKind>) -> bool {
+        match kind {
+            Some(acp::ToolKind::Read) => self.allow_read,
+            Some(acp::ToolKind::Search) => self.allow_search,
+            Some(acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move) => {
+                self.allow_write
+            }
+            Some(acp::ToolKind::Execute) => self.allow_execute,
+            Some(acp::ToolKind::Fetch) => self.allow_fetch,
+            _ => false,
+        }
     }
 }
 
@@ -554,6 +639,51 @@ impl CopilotApiProvider {
             return;
         }
         notified.await;
+    }
+
+    async fn complete_official(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        system: &str,
+        resume_session_id: Option<&str>,
+        working_dir: PathBuf,
+    ) -> Result<EventStream> {
+        self.wait_for_init().await;
+        let CopilotBackend::OfficialCli { process } = &self.backend else {
+            bail!("Copilot transport is not official-cli");
+        };
+        let prompt = build_official_prompt(messages, system, resume_session_id.is_some())?;
+        let process = process.clone();
+        let selected_model = self.model();
+        let resume_session_id = resume_session_id.map(ToOwned::to_owned);
+        let tool_policy = CopilotOfficialToolPolicy::from_jcode_tools(tools);
+        let (tx, rx) = mpsc::channel(128);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+
+        let thread = std::thread::Builder::new()
+            .name("jcode-copilot-official-acp".to_string())
+            .spawn(move || {
+                if let Err(error) = run_official_turn_thread(
+                    process,
+                    selected_model,
+                    resume_session_id,
+                    prompt,
+                    working_dir,
+                    tool_policy,
+                    tx.clone(),
+                    cancel_rx,
+                ) {
+                    let _ = tx.blocking_send(Err(error));
+                }
+            })
+            .context("Failed to start official Copilot CLI ACP runtime thread")?;
+
+        Ok(Box::pin(CopilotOfficialEventStream {
+            inner: ReceiverStream::new(rx),
+            cancel: Some(cancel_tx),
+            thread: Some(thread),
+        }))
     }
 
     /// Get a valid Copilot bearer token, refreshing if expired
@@ -1177,7 +1307,8 @@ fn run_official_turn_thread(
     selected_model: String,
     resume_session_id: Option<String>,
     prompt: String,
-    allow_permissions: bool,
+    working_dir: PathBuf,
+    tool_policy: CopilotOfficialToolPolicy,
     tx: mpsc::Sender<Result<StreamEvent>>,
     cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -1195,12 +1326,11 @@ fn run_official_turn_thread(
 
         with_official_connection(
             process,
-            allow_permissions,
+            tool_policy,
+            Some(working_dir.clone()),
             tx.clone(),
             async move |connection, forward_updates| {
                 let initialized = initialize_official_cli(&connection).await?;
-                let cwd =
-                    std::env::current_dir().context("Failed to determine working directory")?;
                 let (session_id, session_model) =
                     if let Some(session_id) = resume_session_id {
                         if !initialized.agent_capabilities.load_session {
@@ -1211,7 +1341,10 @@ fn run_official_turn_thread(
                         let response = timeout_acp_request(
                             "session/load",
                             connection.load_session(
-                                acp::LoadSessionRequest::new(session_id.clone(), cwd)
+                                acp::LoadSessionRequest::new(
+                                    session_id.clone(),
+                                    working_dir.clone(),
+                                )
                                     .mcp_servers(Vec::new()),
                             ),
                         )
@@ -1224,7 +1357,8 @@ fn run_official_turn_thread(
                         let response = timeout_acp_request(
                             "session/new",
                             connection.new_session(
-                                acp::NewSessionRequest::new(cwd).mcp_servers(Vec::new()),
+                                acp::NewSessionRequest::new(working_dir.clone())
+                                    .mcp_servers(Vec::new()),
                             ),
                         )
                         .await?;
@@ -1353,7 +1487,14 @@ async fn run_on_acp_thread_with_process<T: Send + 'static>(
                     .build()?;
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
-                    with_official_connection(process, false, mpsc::channel(1).0, operation).await
+                    with_official_connection(
+                        process,
+                        CopilotOfficialToolPolicy::default(),
+                        None,
+                        mpsc::channel(1).0,
+                        operation,
+                    )
+                    .await
                 })
             })();
             let _ = result_tx.send(result);
@@ -1366,7 +1507,8 @@ async fn run_on_acp_thread_with_process<T: Send + 'static>(
 
 async fn with_official_connection<T, F, Fut>(
     process: CopilotOfficialCliProcess,
-    allow_permissions: bool,
+    tool_policy: CopilotOfficialToolPolicy,
+    working_dir: Option<PathBuf>,
     event_tx: mpsc::Sender<Result<StreamEvent>>,
     operation: F,
 ) -> Result<T>
@@ -1386,6 +1528,10 @@ where
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    tool_policy.configure_command(&mut command);
+    if let Some(working_dir) = working_dir.as_deref() {
+        command.current_dir(working_dir);
+    }
     let mut child = command.spawn().with_context(|| {
         format!(
             "Failed to launch official Copilot CLI at '{}'",
@@ -1412,7 +1558,7 @@ where
     let client = CopilotAcpClient {
         tx: event_tx,
         forward_updates: Arc::clone(&forward_updates),
-        allow_permissions,
+        tool_policy,
     };
     let (connection, io) =
         acp::ClientSideConnection::new(client, stdin.compat_write(), stdout.compat(), |future| {
@@ -1464,7 +1610,7 @@ async fn capture_stderr(
 struct CopilotAcpClient {
     tx: mpsc::Sender<Result<StreamEvent>>,
     forward_updates: Arc<AtomicBool>,
-    allow_permissions: bool,
+    tool_policy: CopilotOfficialToolPolicy,
 }
 
 #[async_trait(?Send)]
@@ -1473,13 +1619,18 @@ impl acp::Client for CopilotAcpClient {
         &self,
         request: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
-        let selected = self.allow_permissions.then(|| {
+        let selected = if self.tool_policy.allows(request.tool_call.fields.kind) {
             request
                 .options
                 .iter()
                 .find(|option| option.kind == acp::PermissionOptionKind::AllowOnce)
-        });
-        let outcome = match selected.flatten() {
+        } else {
+            request
+                .options
+                .iter()
+                .find(|option| option.kind == acp::PermissionOptionKind::RejectOnce)
+        };
+        let outcome = match selected {
             Some(option) => acp::RequestPermissionOutcome::Selected(
                 acp::SelectedPermissionOutcome::new(option.option_id.clone()),
             ),
@@ -1550,37 +1701,12 @@ impl Provider for CopilotApiProvider {
     ) -> Result<EventStream> {
         self.wait_for_init().await;
 
-        if let CopilotBackend::OfficialCli { process } = &self.backend {
-            let prompt = build_official_prompt(messages, system, resume_session_id.is_some())?;
-            let process = process.clone();
-            let selected_model = self.model();
-            let resume_session_id = resume_session_id.map(ToOwned::to_owned);
-            let allow_permissions = !tools.is_empty();
-            let (tx, rx) = mpsc::channel(128);
-            let (cancel_tx, cancel_rx) = oneshot::channel();
-
-            let thread = std::thread::Builder::new()
-                .name("jcode-copilot-official-acp".to_string())
-                .spawn(move || {
-                    if let Err(error) = run_official_turn_thread(
-                        process,
-                        selected_model,
-                        resume_session_id,
-                        prompt,
-                        allow_permissions,
-                        tx.clone(),
-                        cancel_rx,
-                    ) {
-                        let _ = tx.blocking_send(Err(error));
-                    }
-                })
-                .context("Failed to start official Copilot CLI ACP runtime thread")?;
-
-            return Ok(Box::pin(CopilotOfficialEventStream {
-                inner: ReceiverStream::new(rx),
-                cancel: Some(cancel_tx),
-                thread: Some(thread),
-            }));
+        if matches!(&self.backend, CopilotBackend::OfficialCli { .. }) {
+            let working_dir =
+                std::env::current_dir().context("Failed to determine working directory")?;
+            return self
+                .complete_official(messages, tools, system, resume_session_id, working_dir)
+                .await;
         }
 
         self.get_bearer_token().await.map_err(|e| {
@@ -1683,6 +1809,34 @@ impl Provider for CopilotApiProvider {
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
 
+    async fn complete_split_with_context(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        system_static: &str,
+        system_dynamic: &str,
+        resume_session_id: Option<&str>,
+        request_context: &ProviderRequestContext,
+    ) -> Result<EventStream> {
+        let dynamic_messages = messages_with_dynamic_system_context(messages, system_dynamic);
+        if matches!(&self.backend, CopilotBackend::OfficialCli { .. }) {
+            let working_dir = request_context.working_dir.clone().ok_or_else(|| {
+                anyhow!("Official Copilot CLI requests require a session working directory")
+            })?;
+            return self
+                .complete_official(
+                    &dynamic_messages,
+                    tools,
+                    system_static,
+                    resume_session_id,
+                    working_dir,
+                )
+                .await;
+        }
+        self.complete(&dynamic_messages, tools, system_static, resume_session_id)
+            .await
+    }
+
     fn name(&self) -> &str {
         "copilot"
     }
@@ -1752,6 +1906,15 @@ impl Provider for CopilotApiProvider {
         }
         self.detect_tier_and_set_default().await;
         Ok(())
+    }
+
+    fn model_switch_session_key(&self) -> Option<&'static str> {
+        matches!(&self.backend, CopilotBackend::OfficialCli { .. })
+            .then_some("copilot:official-cli")
+    }
+
+    fn supports_conversation_rewind(&self) -> bool {
+        !matches!(&self.backend, CopilotBackend::OfficialCli { .. })
     }
 
     fn supports_compaction(&self) -> bool {

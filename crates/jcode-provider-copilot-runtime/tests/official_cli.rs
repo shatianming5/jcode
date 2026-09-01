@@ -1,7 +1,7 @@
 use futures::StreamExt;
 use jcode_message_types::{Message, StreamEvent, ToolDefinition};
 use jcode_provider_copilot_runtime::{CopilotApiProvider, CopilotOfficialCliProcess};
-use jcode_provider_core::Provider;
+use jcode_provider_core::{Provider, ProviderRequestContext};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,6 +20,14 @@ fn one_tool() -> ToolDefinition {
     ToolDefinition {
         name: "view".to_string(),
         description: "Read a file".to_string(),
+        input_schema: json!({"type":"object"}),
+    }
+}
+
+fn named_tool(name: &str) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: format!("{name} fixture"),
         input_schema: json!({"type":"object"}),
     }
 }
@@ -127,6 +135,8 @@ async fn fake_official_cli_covers_command_env_handshake_stream_usage_and_permiss
     assert!(requests.contains("\"--acp\""));
     assert!(requests.contains("\"--stdio\""));
     assert!(requests.contains("\"--no-auto-update\""));
+    assert!(requests.contains("\"--disable-builtin-mcps\""));
+    assert!(requests.contains("\"--available-tools=view\""));
     assert!(!requests.contains("\"--allow-all\""));
     assert!(requests.contains("\"sentinel\":\"inherited\""));
     assert!(requests.contains("\"allow_all\":null"));
@@ -246,8 +256,299 @@ async fn no_tool_profile_cancels_permission_requests() {
     while stream.next().await.is_some() {}
 
     let requests = std::fs::read_to_string(log).unwrap();
-    assert!(requests.contains("\"outcome\":\"cancelled\""));
+    assert!(requests.contains("\"--available-tools\""));
+    assert!(!requests.contains("\"--available-tools="));
+    assert!(requests.contains("\"optionId\":\"reject\""));
     assert!(!requests.contains("\"optionId\":\"always\",\"outcome\""));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn view_only_profile_rejects_execute_permission_by_kind() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("permission-view-only.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_PERMISSION".into(), "1".into());
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_PERMISSION_KIND".into(),
+        "execute".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let mut stream = provider
+        .complete(
+            &[Message::user("Try a shell command")],
+            &[named_tool("view")],
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert!(
+        requests.contains("\"optionId\":\"reject\",\"outcome\":\"selected\""),
+        "{requests}"
+    );
+    assert!(
+        !requests.contains("\"optionId\":\"once\",\"outcome\":\"selected\""),
+        "{requests}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn view_only_profile_rejects_write_permission_by_kind() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("permission-write-view-only.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_PERMISSION".into(), "1".into());
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_PERMISSION_KIND".into(),
+        "edit".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let mut stream = provider
+        .complete(
+            &[Message::user("Try a write")],
+            &[named_tool("view")],
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert!(
+        requests.contains("\"optionId\":\"reject\",\"outcome\":\"selected\""),
+        "{requests}"
+    );
+    assert!(
+        requests.contains("\"--available-tools=view\""),
+        "{requests}"
+    );
+    assert!(!requests.contains("available-tools=bash"), "{requests}");
+    assert!(!requests.contains("available-tools=create"), "{requests}");
+    assert!(!requests.contains("available-tools=edit"), "{requests}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unmapped_permission_kind_is_rejected_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("permission-unknown.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_PERMISSION".into(), "1".into());
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_PERMISSION_KIND".into(),
+        "other".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let mut stream = provider
+        .complete(
+            &[Message::user("Try an unknown tool")],
+            &[named_tool("view"), named_tool("bash"), named_tool("write")],
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert!(
+        requests.contains("\"optionId\":\"reject\",\"outcome\":\"selected\""),
+        "{requests}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_profile_keeps_read_available_and_selects_allow_once_by_option_kind() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("permission-full-read.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_PERMISSION".into(), "1".into());
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_PERMISSION_KIND".into(),
+        "read".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+    let tools = [named_tool("view"), named_tool("bash"), named_tool("write")];
+
+    let mut stream = provider
+        .complete(&[Message::user("Read a file")], &tools, "", None)
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert!(
+        requests.contains("\"optionId\":\"once\",\"outcome\":\"selected\""),
+        "{requests}"
+    );
+    assert!(
+        !requests.contains("\"optionId\":\"always\",\"outcome\":\"selected\""),
+        "{requests}"
+    );
+    assert!(
+        requests.contains("\"--available-tools=bash,create,view\""),
+        "{requests}"
+    );
+}
+
+async fn complete_in_dir(
+    provider: &CopilotApiProvider,
+    working_dir: &Path,
+    messages: &[Message],
+    resume_session_id: Option<&str>,
+) -> Vec<StreamEvent> {
+    let request_context = ProviderRequestContext::new(Some(working_dir.to_path_buf()));
+    let mut stream = provider
+        .complete_split_with_context(
+            messages,
+            &[one_tool()],
+            "",
+            "",
+            resume_session_id,
+            &request_context,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    events
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn request_context_sets_child_and_acp_cwd_without_cross_session_leakage() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_dir = temp.path().join("session-one");
+    let second_dir = temp.path().join("session-two");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let first_dir = std::fs::canonicalize(first_dir).unwrap();
+    let second_dir = std::fs::canonicalize(second_dir).unwrap();
+    assert_ne!(std::env::current_dir().unwrap(), first_dir);
+    assert_ne!(std::env::current_dir().unwrap(), second_dir);
+    let log_dir = temp.path().join("cwd-logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let mut process = CopilotOfficialCliProcess::with_command(
+        env!("CARGO_BIN_EXE_jcode-fake-copilot-acp").into(),
+    );
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_LOG_DIR".to_string(),
+        log_dir.display().to_string(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+    let first_messages = [Message::user("first")];
+    let second_messages = [Message::user("second")];
+
+    let (first, second) = tokio::join!(
+        complete_in_dir(&provider, &first_dir, &first_messages, None),
+        complete_in_dir(&provider, &second_dir, &second_messages, None)
+    );
+    assert!(
+        first
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+    );
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+    );
+
+    for working_dir in [&first_dir, &second_dir] {
+        let log = log_dir.join(format!(
+            "{}.jsonl",
+            working_dir.file_name().unwrap().to_string_lossy()
+        ));
+        let requests = std::fs::read_to_string(log).unwrap();
+        let encoded = serde_json::to_string(working_dir).unwrap();
+        let needle = format!("\"cwd\":{encoded}");
+        assert!(
+            requests.matches(&needle).count() >= 2,
+            "child cwd and ACP cwd did not both use {} in {requests}",
+            working_dir.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn established_session_continues_after_model_switch_via_load_and_set_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let working_dir = temp.path().join("session");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    let log = temp.path().join("model-switch.jsonl");
+    let provider = CopilotApiProvider::with_official_process(fake_process(&log));
+    provider.complete_init_without_tier_detection();
+
+    let first = complete_in_dir(
+        &provider,
+        &working_dir,
+        &[Message::user("first turn")],
+        None,
+    )
+    .await;
+    let session_id = first
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::SessionId(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("first turn session id");
+
+    provider.set_model("gpt-5-mini").unwrap();
+    let second = complete_in_dir(
+        &provider,
+        &working_dir,
+        &[
+            Message::user("first turn"),
+            Message::assistant_text("OK"),
+            Message::user("second turn"),
+        ],
+        Some(&session_id),
+    )
+    .await;
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+    );
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert!(
+        requests.contains("\"method\":\"session/load\""),
+        "{requests}"
+    );
+    assert!(
+        requests.contains("\"sessionId\":\"fake-copilot-session\""),
+        "{requests}"
+    );
+    assert!(
+        requests.contains("\"method\":\"session/set_model\""),
+        "{requests}"
+    );
+    assert!(
+        requests.contains("\"modelId\":\"gpt-5-mini\""),
+        "{requests}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -833,3 +833,46 @@ fn anthropic_model_scoped_exhaustion_matches_display_name_to_catalog_id() {
     };
     assert!(!below_limit.model_scoped_exhausted("claude-fable-5"));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn official_copilot_usage_is_cli_managed_without_native_credentials() {
+    let _guard = crate::storage::lock_test_env();
+    let saved_transport = std::env::var("JCODE_COPILOT_TRANSPORT").ok();
+    let saved_cli_path = std::env::var("JCODE_COPILOT_CLI_PATH").ok();
+    let saved_jcode_home = std::env::var("JCODE_HOME").ok();
+    let saved_copilot_token = std::env::var("COPILOT_GITHUB_TOKEN").ok();
+    let saved_gh_token = std::env::var("GH_TOKEN").ok();
+    let saved_github_token = std::env::var("GITHUB_TOKEN").ok();
+    let temp = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_COPILOT_TRANSPORT", "official-cli");
+    crate::env::set_var("JCODE_COPILOT_CLI_PATH", "/usr/bin/false");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::remove_var("COPILOT_GITHUB_TOKEN");
+    crate::env::remove_var("GH_TOKEN");
+    crate::env::remove_var("GITHUB_TOKEN");
+
+    let report = fetch_copilot_usage_report()
+        .await
+        .expect("official-cli usage should return a CLI-managed report");
+
+    assert!(report.limits.is_empty());
+    assert!(report.extra_info.iter().any(|(label, detail)| {
+        label == "Remote quota"
+            && detail.contains("Unsupported for official-cli transport")
+            && detail.contains("CLI-managed")
+    }));
+
+    for (key, value) in [
+        ("JCODE_COPILOT_TRANSPORT", saved_transport),
+        ("JCODE_COPILOT_CLI_PATH", saved_cli_path),
+        ("JCODE_HOME", saved_jcode_home),
+        ("COPILOT_GITHUB_TOKEN", saved_copilot_token),
+        ("GH_TOKEN", saved_gh_token),
+        ("GITHUB_TOKEN", saved_github_token),
+    ] {
+        match value {
+            Some(value) => crate::env::set_var(key, value),
+            None => crate::env::remove_var(key),
+        }
+    }
+}

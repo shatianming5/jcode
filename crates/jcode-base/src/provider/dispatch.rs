@@ -27,6 +27,39 @@ impl CompletionMode<'_> {
     }
 }
 
+async fn complete_split_for_request(
+    provider: &dyn Provider,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    system_static: &str,
+    system_dynamic: &str,
+    resume_session_id: Option<&str>,
+    request_context: Option<&ProviderRequestContext>,
+) -> Result<EventStream> {
+    if let Some(request_context) = request_context {
+        provider
+            .complete_split_with_context(
+                messages,
+                tools,
+                system_static,
+                system_dynamic,
+                resume_session_id,
+                request_context,
+            )
+            .await
+    } else {
+        provider
+            .complete_split(
+                messages,
+                tools,
+                system_static,
+                system_dynamic,
+                resume_session_id,
+            )
+            .await
+    }
+}
+
 impl MultiProvider {
     pub(super) fn estimate_request_input(
         messages: &[Message],
@@ -182,30 +215,33 @@ impl MultiProvider {
         system_static: &str,
         system_dynamic: &str,
         resume_session_id: Option<&str>,
+        request_context: Option<&ProviderRequestContext>,
     ) -> Result<EventStream> {
         self.reconcile_auth_if_provider_missing(provider);
         match provider {
             ActiveProvider::Claude => {
                 if let Some(anthropic) = self.anthropic_provider() {
-                    anthropic
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        anthropic.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else if let Some(claude) = self.claude_provider() {
-                    claude
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        claude.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "Claude credentials not available. Run `claude` to log in."
@@ -214,15 +250,16 @@ impl MultiProvider {
             }
             ActiveProvider::OpenAI => {
                 if let Some(openai) = self.openai_provider() {
-                    openai
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        openai.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "OpenAI credentials not available. Run `jcode login --provider openai` to log in."
@@ -236,15 +273,16 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(copilot) = copilot {
-                    copilot
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        copilot.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(copilot::unavailable_message()))
                 }
@@ -252,15 +290,16 @@ impl MultiProvider {
             ActiveProvider::Antigravity => {
                 let antigravity = self.antigravity_provider();
                 if let Some(antigravity) = antigravity {
-                    antigravity
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        antigravity.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "Antigravity is not available. Run `jcode login --provider antigravity`."
@@ -274,15 +313,16 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(gemini) = gemini {
-                    gemini
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        gemini.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "Gemini is not available. Run `jcode login --provider gemini`."
@@ -296,15 +336,16 @@ impl MultiProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 if let Some(cursor) = cursor {
-                    cursor
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        cursor.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "Cursor is not available. Run `jcode login --provider cursor`."
@@ -313,15 +354,16 @@ impl MultiProvider {
             }
             ActiveProvider::Bedrock => {
                 if let Some(bedrock) = self.bedrock_provider() {
-                    bedrock
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        bedrock.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "AWS Bedrock is not available. Configure AWS credentials and region, or set AWS_PROFILE/AWS_REGION."
@@ -331,15 +373,16 @@ impl MultiProvider {
             ActiveProvider::OpenRouter => {
                 let openrouter = self.active_openrouter_execution_provider();
                 if let Some(openrouter) = openrouter {
-                    openrouter
-                        .complete_split(
-                            messages,
-                            tools,
-                            system_static,
-                            system_dynamic,
-                            resume_session_id,
-                        )
-                        .await
+                    complete_split_for_request(
+                        openrouter.as_ref(),
+                        messages,
+                        tools,
+                        system_static,
+                        system_dynamic,
+                        resume_session_id,
+                        request_context,
+                    )
+                    .await
                 } else {
                     Err(anyhow::anyhow!(
                         "OpenRouter credentials not available. Set OPENROUTER_API_KEY environment variable."

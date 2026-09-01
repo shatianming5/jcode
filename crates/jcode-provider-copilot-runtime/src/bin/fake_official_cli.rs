@@ -3,7 +3,19 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 
 fn append_log(value: &Value) {
-    let path = std::env::var("JCODE_FAKE_COPILOT_ACP_LOG").expect("fake log path");
+    let path = if let Ok(directory) = std::env::var("JCODE_FAKE_COPILOT_ACP_LOG_DIR") {
+        let name = std::env::current_dir()
+            .expect("fake cwd")
+            .file_name()
+            .expect("fake cwd name")
+            .to_string_lossy()
+            .to_string();
+        std::path::PathBuf::from(directory).join(format!("{name}.jsonl"))
+    } else {
+        std::env::var("JCODE_FAKE_COPILOT_ACP_LOG")
+            .expect("fake log path")
+            .into()
+    };
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -27,6 +39,7 @@ fn main() {
     append_log(&json!({
         "process": {
             "args": std::env::args().skip(1).collect::<Vec<_>>(),
+            "cwd": std::env::current_dir().expect("fake cwd"),
             "sentinel": std::env::var("JCODE_FAKE_COPILOT_PARENT_SENTINEL").ok(),
             "allow_all": std::env::var("COPILOT_ALLOW_ALL").ok(),
         }
@@ -108,15 +121,22 @@ fn main() {
                     continue;
                 }
                 if std::env::var_os("JCODE_FAKE_COPILOT_ACP_PERMISSION").is_some() {
+                    let kind = std::env::var("JCODE_FAKE_COPILOT_ACP_PERMISSION_KIND")
+                        .unwrap_or_else(|_| "read".to_string());
                     send(json!({
                         "jsonrpc":"2.0",
                         "id":900,
                         "method":"session/request_permission",
                         "params":{
                             "sessionId":"fake-copilot-session",
-                            "toolCall":{"toolCallId":"tool-1", "title":"Run a command"},
+                            "toolCall":{
+                                "toolCallId":"tool-1",
+                                "title":"Permission fixture",
+                                "kind":kind
+                            },
                             "options":[
                                 {"optionId":"always", "name":"Always allow", "kind":"allow_always"},
+                                {"optionId":"reject", "name":"Reject once", "kind":"reject_once"},
                                 {"optionId":"once", "name":"Allow once", "kind":"allow_once"}
                             ]
                         }

@@ -80,6 +80,7 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "launch" => "open",
         "shell" => "bash",
         "shell_exec" => "bash",
+        "view" => "read",
         "read_file" => "read",
         "file_read" => "read",
         "write_file" => "write",
@@ -120,6 +121,7 @@ mod tests {
         assert_eq!(resolve_tool_name("functions.bash"), "bash");
         assert_eq!(resolve_tool_name("functions.shell_exec"), "bash");
         assert_eq!(resolve_tool_name("functions.file_grep"), "agentgrep");
+        assert_eq!(resolve_tool_name("view"), "read");
     }
 
     #[test]

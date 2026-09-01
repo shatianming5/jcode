@@ -226,6 +226,8 @@ impl Agent {
             // `ModelChanged` and resync the UI/context-limit.
             let model_at_request_start = provider.model().to_string();
             let resume_session_id = self.provider_session_id.clone();
+            let request_context =
+                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from));
             self.last_status_detail = None;
             let _ = event_tx.send(kv_cache_request_event(
                 &cache_signature_messages,
@@ -240,12 +242,13 @@ impl Agent {
             drop(ephemeral_signature_messages);
             let mut keepalive = stream_keepalive_ticker();
             let mut stream = {
-                let mut complete_future = std::pin::pin!(provider.complete_split(
+                let mut complete_future = std::pin::pin!(provider.complete_split_with_context(
                     send_messages,
                     &tools,
                     &split_prompt.static_part,
                     &split_prompt.dynamic_part,
                     resume_session_id.as_deref(),
+                    &request_context,
                 ));
                 loop {
                     tokio::select! {

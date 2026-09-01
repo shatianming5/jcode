@@ -64,12 +64,29 @@ use jcode_message_types::{
     ContentBlock, Message, Role, StreamEvent, ToolDefinition, messages_with_dynamic_system_context,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Stream of events from a provider.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+
+/// Per-request state owned by the caller's local session.
+///
+/// Providers that launch subprocesses must use this instead of process-global
+/// state such as `std::env::current_dir()`, because one long-lived server can
+/// serve multiple sessions rooted in different directories.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderRequestContext {
+    pub working_dir: Option<PathBuf>,
+}
+
+impl ProviderRequestContext {
+    pub fn new(working_dir: Option<PathBuf>) -> Self {
+        Self { working_dir }
+    }
+}
 
 /// Provider trait for LLM backends.
 #[async_trait]
@@ -96,6 +113,30 @@ pub trait Provider: Send + Sync {
         let dynamic_messages = messages_with_dynamic_system_context(messages, system_dynamic);
         self.complete(&dynamic_messages, tools, system_static, resume_session_id)
             .await
+    }
+
+    /// Send messages with caller-owned request context.
+    ///
+    /// Most providers do not need local session state, so the default preserves
+    /// their existing split-prompt implementation. Subprocess providers that do
+    /// need a session cwd override this method.
+    async fn complete_split_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_static: &str,
+        system_dynamic: &str,
+        resume_session_id: Option<&str>,
+        _request_context: &ProviderRequestContext,
+    ) -> Result<EventStream> {
+        self.complete_split(
+            messages,
+            tools,
+            system_static,
+            system_dynamic,
+            resume_session_id,
+        )
+        .await
     }
 
     /// Get the provider name.
@@ -181,6 +222,19 @@ pub trait Provider: Send + Sync {
     /// by [`RouteSelection::runtime_key`] instead of reparsing a lossy model string.
     fn set_route_selection(&self, selection: &RouteSelection) -> Result<()> {
         self.set_model(&selection.routed_model_spec())
+    }
+
+    /// Stable identity of an upstream session that can survive an in-provider
+    /// model switch. `None` means the caller must clear its provider session.
+    fn model_switch_session_key(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether the provider can rebuild a conversation after local history is
+    /// truncated. Providers backed by an opaque upstream transcript return
+    /// false so `/rewind` is rejected before local state changes.
+    fn supports_conversation_rewind(&self) -> bool {
+        true
     }
 
     /// List available models for this provider.

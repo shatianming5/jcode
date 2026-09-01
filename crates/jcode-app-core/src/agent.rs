@@ -7,6 +7,8 @@ mod interrupts;
 mod messages;
 mod prompting;
 mod provider;
+#[cfg(test)]
+mod provider_session_tests;
 mod response_recovery;
 mod status;
 mod streaming;
