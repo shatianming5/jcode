@@ -30,4 +30,6 @@
 
 ## Next
 
-- Commit, push the fork branch, and create the concise draft PR.
+- Fork branch is pushed. GitHub rejected upstream draft PR creation for
+  `shatianming5` with `CreatePullRequest` permission errors (REST returned 404),
+  so no PR was opened; the implementation itself has no remaining blocker.
