@@ -20,6 +20,10 @@
   fork so model state stays session-local, validate official internal tool smoke
   from ACP status plus exact final text, and reject `auth-test --login` before
   Jcode's native device/token flow.
+- Terminal review fixes also make Copilot fork-local premium mode, reasoning
+  effort, and OnePerSession turn counting; expose structured provider-tool
+  lifecycle updates; and scope official CLI configuration-notice stripping to
+  auth-test only so ordinary assistant text is untouched.
 
 ## Evidence
 
@@ -48,8 +52,18 @@
   any native login flow; isolated pending-login and saved-token paths remained
   absent.
 - Official CLI `Info: Disabled tools: ...` configuration notifications are
-  filtered from assistant text; the real full auth-test no longer sees status
-  text concatenated with its final marker.
+  stripped only by auth-test when they are independent notification fragments;
+  a same-chunk `AUTH_TEST_OK` body is retained, while an ordinary real run
+  returning `Info: Disabled tools: legitimate` preserves that text verbatim.
+- Strict internal-tool smoke requires one read/search tool ID to enter
+  pending/in-progress and then completed. Completed-only, failed, incomplete,
+  and execute-kind fixtures are rejected; the real read-only `Cargo.toml` smoke
+  passes this lifecycle check.
+- `cargo test -p jcode-provider-copilot-runtime --test official_cli` now passes
+  15 tests; fork settings and per-fork first-turn tests pass; full
+  `cargo check -p jcode --no-default-features` passes.
+- Final new-login-shell smokes: official auth-test exit 0, ordinary text exactly
+  `OK`, legitimate `Info:`-prefixed reply preserved, and no orphan ACP child.
 - `cargo test -p jcode-app-core --no-default-features provider_session_tests`
 - `cargo test -p jcode-base --no-default-features
   official_copilot_usage_is_cli_managed_without_native_credentials`
@@ -83,5 +97,5 @@
 
 ## Next
 
-- Refresh draft PR #1 with final-review evidence. Upstream PR creation remains
-  unnecessary after the known `CreatePullRequest`/404 permission blocker.
+- Commit/push terminal-review fixes, refresh draft PR #1, and atomically promote
+  the next clean dev build while retaining rollback versions.

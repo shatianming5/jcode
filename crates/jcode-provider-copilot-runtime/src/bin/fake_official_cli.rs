@@ -160,6 +160,8 @@ fn main() {
                         }
                     }
                 }));
+                let reply = std::env::var("JCODE_FAKE_COPILOT_ACP_REPLY")
+                    .unwrap_or_else(|_| "OK".to_string());
                 send(json!({
                     "jsonrpc":"2.0",
                     "method":"session/update",
@@ -193,7 +195,7 @@ fn main() {
                         "sessionId":"fake-copilot-session",
                         "update":{
                             "sessionUpdate":"agent_message_chunk",
-                            "content":{"type":"text", "text":"OK"}
+                            "content":{"type":"text", "text":reply}
                         }
                     }
                 }));

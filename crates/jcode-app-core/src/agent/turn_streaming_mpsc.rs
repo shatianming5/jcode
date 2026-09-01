@@ -718,6 +718,7 @@ impl Agent {
                         self.last_status_detail = Some(detail.clone());
                         let _ = event_tx.send(ServerEvent::StatusDetail { detail });
                     }
+                    StreamEvent::ProviderToolUpdate { .. } => {}
                     StreamEvent::RetryRollback { attempt, max } => {
                         // A transient transport fault hit mid-stream after partial
                         // output was already emitted; the provider is replaying the

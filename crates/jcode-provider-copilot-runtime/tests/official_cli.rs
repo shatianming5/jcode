@@ -242,6 +242,37 @@ async fn official_failure_surfaces_stderr_without_native_fallback() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn ordinary_run_preserves_legitimate_info_prefixed_assistant_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("legitimate-info-prefix.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_REPLY".into(),
+        "Info: Disabled tools: legitimate".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let mut stream = provider
+        .complete(
+            &[Message::user("Return the requested literal text")],
+            &[],
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+    let mut output = String::new();
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::TextDelta(text) = event.unwrap() {
+            output.push_str(&text);
+        }
+    }
+
+    assert_eq!(output, "Info: Disabled tools: legitimate");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn no_tool_profile_cancels_permission_requests() {
     let temp = tempfile::tempdir().unwrap();
     let log = temp.path().join("permission-cancel.jsonl");

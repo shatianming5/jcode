@@ -12,8 +12,8 @@ use chrono::Utc;
 use futures::Stream;
 use jcode_base::auth::copilot as copilot_auth;
 use jcode_message_types::{
-    ContentBlock, Message as ChatMessage, Role, StreamEvent, ToolDefinition,
-    messages_with_dynamic_system_context,
+    ContentBlock, Message as ChatMessage, ProviderToolKind, ProviderToolStatus, Role, StreamEvent,
+    ToolDefinition, messages_with_dynamic_system_context,
 };
 #[cfg(test)]
 use jcode_provider_copilot::max_token_parameter_for_model as copilot_max_token_parameter_for_model;
@@ -463,6 +463,23 @@ impl CopilotApiProvider {
             1 => PremiumMode::OnePerSession,
             2 => PremiumMode::Zero,
             _ => PremiumMode::Normal,
+        }
+    }
+
+    fn fork_for_session(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            model: Arc::new(RwLock::new(self.model())),
+            fetched_models: self.fetched_models.clone(),
+            catalog_source: self.catalog_source.clone(),
+            init_ready: self.init_ready.clone(),
+            init_done: self.init_done.clone(),
+            premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(
+                self.premium_mode.load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reasoning_effort: Arc::new(RwLock::new(self.current_reasoning_effort())),
+            created_at: self.created_at,
         }
     }
 
@@ -1646,33 +1663,72 @@ impl acp::Client for CopilotAcpClient {
         if !self.forward_updates.load(Ordering::Acquire) {
             return Ok(());
         }
-        let event = match notification.update {
+        let events: Vec<StreamEvent> = match notification.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => text_from_acp_content(chunk.content)
-                .filter(|text| !is_official_cli_configuration_info(text))
-                .map(StreamEvent::TextDelta),
-            acp::SessionUpdate::AgentThoughtChunk(chunk) => {
-                text_from_acp_content(chunk.content).map(StreamEvent::ThinkingDelta)
-            }
+                .map(StreamEvent::TextDelta)
+                .into_iter()
+                .collect(),
+            acp::SessionUpdate::AgentThoughtChunk(chunk) => text_from_acp_content(chunk.content)
+                .map(StreamEvent::ThinkingDelta)
+                .into_iter()
+                .collect(),
             acp::SessionUpdate::ToolCall(call) => {
-                Some(StreamEvent::StatusDetail { detail: call.title })
+                let title = call.title;
+                vec![
+                    StreamEvent::ProviderToolUpdate {
+                        id: call.tool_call_id.0.to_string(),
+                        kind: Some(provider_tool_kind(call.kind)),
+                        status: Some(provider_tool_status(call.status)),
+                        title: Some(title.clone()),
+                    },
+                    StreamEvent::StatusDetail { detail: title },
+                ]
             }
-            acp::SessionUpdate::ToolCallUpdate(update) => update
-                .fields
-                .title
-                .map(|detail| StreamEvent::StatusDetail { detail }),
-            _ => None,
+            acp::SessionUpdate::ToolCallUpdate(update) => {
+                let fields = update.fields;
+                let mut events = vec![StreamEvent::ProviderToolUpdate {
+                    id: update.tool_call_id.0.to_string(),
+                    kind: fields.kind.map(provider_tool_kind),
+                    status: fields.status.map(provider_tool_status),
+                    title: fields.title.clone(),
+                }];
+                if let Some(detail) = fields.title {
+                    events.push(StreamEvent::StatusDetail { detail });
+                }
+                events
+            }
+            _ => Vec::new(),
         };
-        if let Some(event) = event {
+        for event in events {
             let _ = self.tx.send(Ok(event)).await;
         }
         Ok(())
     }
 }
 
-fn is_official_cli_configuration_info(text: &str) -> bool {
-    text.starts_with("Info: Disabled tools: ")
-        || text.starts_with("Info: Unknown tool name in the tool allowlist: ")
-        || text.starts_with("Info: Unknown tool name in the tool excludedlist: ")
+fn provider_tool_kind(kind: acp::ToolKind) -> ProviderToolKind {
+    match kind {
+        acp::ToolKind::Read => ProviderToolKind::Read,
+        acp::ToolKind::Search => ProviderToolKind::Search,
+        acp::ToolKind::Edit => ProviderToolKind::Edit,
+        acp::ToolKind::Delete => ProviderToolKind::Delete,
+        acp::ToolKind::Move => ProviderToolKind::Move,
+        acp::ToolKind::Execute => ProviderToolKind::Execute,
+        acp::ToolKind::Fetch => ProviderToolKind::Fetch,
+        acp::ToolKind::Think => ProviderToolKind::Think,
+        acp::ToolKind::SwitchMode => ProviderToolKind::SwitchMode,
+        _ => ProviderToolKind::Other,
+    }
+}
+
+fn provider_tool_status(status: acp::ToolCallStatus) -> ProviderToolStatus {
+    match status {
+        acp::ToolCallStatus::Pending => ProviderToolStatus::Pending,
+        acp::ToolCallStatus::InProgress => ProviderToolStatus::InProgress,
+        acp::ToolCallStatus::Completed => ProviderToolStatus::Completed,
+        acp::ToolCallStatus::Failed => ProviderToolStatus::Failed,
+        _ => ProviderToolStatus::Other,
+    }
 }
 
 fn text_from_acp_content(content: acp::ContentBlock) -> Option<String> {
@@ -1945,18 +2001,7 @@ impl Provider for CopilotApiProvider {
     }
 
     fn fork(&self) -> Arc<dyn Provider> {
-        Arc::new(CopilotApiProvider {
-            backend: self.backend.clone(),
-            model: Arc::new(RwLock::new(self.model())),
-            fetched_models: self.fetched_models.clone(),
-            catalog_source: self.catalog_source.clone(),
-            init_ready: self.init_ready.clone(),
-            init_done: self.init_done.clone(),
-            premium_mode: self.premium_mode.clone(),
-            user_turn_count: self.user_turn_count.clone(),
-            reasoning_effort: self.reasoning_effort.clone(),
-            created_at: self.created_at,
-        })
+        Arc::new(self.fork_for_session())
     }
 
     fn reasoning_effort(&self) -> Option<String> {

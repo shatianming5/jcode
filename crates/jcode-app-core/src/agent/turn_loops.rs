@@ -487,6 +487,7 @@ impl Agent {
                         }
                         self.last_status_detail = Some(detail);
                     }
+                    StreamEvent::ProviderToolUpdate { .. } => {}
                     StreamEvent::RetryRollback { attempt, max } => {
                         // Transient transport fault mid-stream; the provider is
                         // replaying the request. Discard this attempt's partial

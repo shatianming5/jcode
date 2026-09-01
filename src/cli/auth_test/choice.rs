@@ -337,8 +337,8 @@ async fn run_internal_provider_tool_smoke(
     let request_context =
         crate::provider::ProviderRequestContext::new(Some(working_dir));
     let tools = [crate::message::ToolDefinition {
-        name: "agentgrep".to_string(),
-        description: "Read-only file listing and search".to_string(),
+        name: "read".to_string(),
+        description: "Read a file without modifying it".to_string(),
         input_schema: serde_json::json!({"type":"object"}),
     }];
     let messages = [crate::message::Message::user(
@@ -349,28 +349,116 @@ async fn run_internal_provider_tool_smoke(
         .await
         .context("Internal provider tool smoke failed to open a response stream")?;
     let mut output = String::new();
-    let mut status_details = Vec::new();
+    let mut tool_updates = Vec::new();
     while let Some(event) = stream.next().await {
         match event? {
-            crate::message::StreamEvent::TextDelta(text) => output.push_str(&text),
-            crate::message::StreamEvent::StatusDetail { detail } if !detail.trim().is_empty() => {
-                status_details.push(detail);
+            crate::message::StreamEvent::TextDelta(text) => {
+                if let Some(text) = auth_test_assistant_text_fragment(&text) {
+                    output.push_str(text);
+                }
+            }
+            crate::message::StreamEvent::ProviderToolUpdate {
+                id, kind, status, ..
+            } => {
+                tool_updates.push(InternalToolUpdate { id, kind, status });
             }
             _ => {}
         }
     }
-    if status_details.is_empty() {
-        anyhow::bail!(
-            "internal tool smoke returned no ACP tool status evidence before the final response"
-        );
+    validate_internal_provider_tool_smoke(&tool_updates, &output)?;
+    Ok(output.trim().to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalToolUpdate {
+    id: String,
+    kind: Option<crate::message::ProviderToolKind>,
+    status: Option<crate::message::ProviderToolStatus>,
+}
+
+fn auth_test_assistant_text_fragment(text: &str) -> Option<&str> {
+    const PREFIXES: [&str; 3] = [
+        "Info: Disabled tools: ",
+        "Info: Unknown tool name in the tool allowlist: ",
+        "Info: Unknown tool name in the tool excludedlist: ",
+    ];
+    if !PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
+        return Some(text);
     }
+    if let Some(marker) = text.find("AUTH_TEST_OK") {
+        return Some(&text[marker..]);
+    }
+    text.find('\n')
+        .map(|newline| text[newline + 1..].trim_start())
+        .filter(|body| !body.is_empty())
+}
+
+fn validate_internal_provider_tool_smoke(
+    updates: &[InternalToolUpdate],
+    output: &str,
+) -> Result<()> {
     if output.trim() != "AUTH_TEST_OK" {
         anyhow::bail!(
             "internal tool smoke final response was {:?}, expected exactly AUTH_TEST_OK",
             output.trim()
         );
     }
-    Ok(output.trim().to_string())
+    let ids = updates
+        .iter()
+        .map(|update| update.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if ids.len() != 1 {
+        anyhow::bail!(
+            "internal tool smoke expected one ACP tool call id, observed {}",
+            ids.len()
+        );
+    }
+    let id = ids.into_iter().next().unwrap_or_default();
+    let mut kind = None;
+    let mut saw_started = false;
+    let mut completed_after_start = false;
+    let mut failed = false;
+    for update in updates.iter().filter(|update| update.id == id) {
+        if let Some(update_kind) = update.kind {
+            if let Some(existing) = kind
+                && existing != update_kind
+            {
+                anyhow::bail!(
+                    "internal tool smoke changed ACP tool kind for {id}: {existing:?} -> {update_kind:?}"
+                );
+            }
+            kind = Some(update_kind);
+        }
+        match update.status {
+            Some(
+                crate::message::ProviderToolStatus::Pending
+                | crate::message::ProviderToolStatus::InProgress,
+            ) => saw_started = true,
+            Some(crate::message::ProviderToolStatus::Completed) if saw_started => {
+                completed_after_start = true;
+            }
+            Some(crate::message::ProviderToolStatus::Failed) => failed = true,
+            _ => {}
+        }
+    }
+    if !matches!(
+        kind,
+        Some(
+            crate::message::ProviderToolKind::Read | crate::message::ProviderToolKind::Search
+        )
+    ) {
+        anyhow::bail!("internal tool smoke used non-read-only ACP tool kind {kind:?}");
+    }
+    if failed {
+        anyhow::bail!("internal tool smoke ACP tool {id} failed");
+    }
+    if !saw_started {
+        anyhow::bail!("internal tool smoke ACP tool {id} never entered pending/in-progress state");
+    }
+    if !completed_after_start {
+        anyhow::bail!("internal tool smoke ACP tool {id} did not complete after starting");
+    }
+    Ok(())
 }
 
 fn validate_auth_test_tool_smoke_transcript(
@@ -656,6 +744,100 @@ mod auth_tool_smoke_tests {
                 }],
             ),
         ]
+    }
+
+    fn internal_update(
+        kind: Option<crate::message::ProviderToolKind>,
+        status: Option<crate::message::ProviderToolStatus>,
+    ) -> InternalToolUpdate {
+        InternalToolUpdate {
+            id: "internal-1".to_string(),
+            kind,
+            status,
+        }
+    }
+
+    #[test]
+    fn auth_test_configuration_info_strips_only_the_notification_fragment() {
+        assert_eq!(
+            auth_test_assistant_text_fragment("Info: Disabled tools: bash, edit"),
+            None
+        );
+        assert_eq!(
+            auth_test_assistant_text_fragment(
+                "Info: Disabled tools: bash, edit\nAUTH_TEST_OK"
+            ),
+            Some("AUTH_TEST_OK")
+        );
+        assert_eq!(
+            auth_test_assistant_text_fragment(
+                "Info: Disabled tools: bash, editAUTH_TEST_OK"
+            ),
+            Some("AUTH_TEST_OK")
+        );
+    }
+
+    #[test]
+    fn internal_tool_smoke_accepts_started_read_only_tool_that_completes() {
+        validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Search),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .expect("completed read-only internal tool");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_failed_tool() {
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::InProgress),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Failed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_tool_that_never_completes() {
+        let error = validate_internal_provider_tool_smoke(
+            &[internal_update(
+                Some(crate::message::ProviderToolKind::Search),
+                Some(crate::message::ProviderToolStatus::Pending),
+            )],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not complete"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_completed_non_read_only_tool() {
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Execute),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("non-read-only"), "{error}");
     }
 
     #[test]

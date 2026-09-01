@@ -97,8 +97,20 @@ for line in sys.stdin:
                 "update": {
                     "sessionUpdate": "tool_call",
                     "toolCallId": "auth-tool",
-                    "title": "Searching current directory",
-                    "kind": "search",
+                    "title": "Reading Cargo.toml",
+                    "kind": "read",
+                    "status": "pending",
+                },
+            },
+        }), flush=True)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "auth-test-session",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "auth-tool",
                     "status": "completed",
                 },
             },
@@ -235,10 +247,7 @@ async fn official_copilot_full_auth_test_uses_internal_read_only_tool_evidence()
     .expect("full official Copilot auth-test should pass");
 
     let requests = std::fs::read_to_string(log).unwrap();
-    assert!(
-        requests.contains("--available-tools=glob,grep"),
-        "{requests}"
-    );
+    assert!(requests.contains("--available-tools=view"), "{requests}");
     assert!(
         requests.matches("\"method\": \"session/prompt\"").count() >= 3,
         "{requests}"

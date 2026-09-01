@@ -48,6 +48,46 @@ fn native_copilot_fork_keeps_model_state_session_local() {
 }
 
 #[test]
+fn copilot_forks_do_not_share_reasoning_or_premium_settings() {
+    let provider = make_test_provider(Vec::new());
+    provider.set_model("claude-sonnet-5").unwrap();
+    provider.set_reasoning_effort("high").unwrap();
+    provider.set_premium_mode(PremiumMode::OnePerSession);
+    let first = provider.fork();
+    let second = provider.fork();
+
+    first.set_reasoning_effort("low").unwrap();
+    first.set_premium_mode(PremiumMode::Zero);
+
+    assert_eq!(first.reasoning_effort().as_deref(), Some("low"));
+    assert_eq!(first.premium_mode(), PremiumMode::Zero);
+    assert_eq!(second.reasoning_effort().as_deref(), Some("high"));
+    assert_eq!(second.premium_mode(), PremiumMode::OnePerSession);
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("high"));
+    assert_eq!(provider.premium_mode(), PremiumMode::OnePerSession);
+}
+
+#[test]
+fn one_per_session_forks_each_start_with_their_own_first_turn() {
+    let provider = make_test_provider(Vec::new());
+    provider.set_premium_mode(PremiumMode::OnePerSession);
+    provider
+        .user_turn_count
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let first = provider.fork_for_session();
+    let second = provider.fork_for_session();
+    let messages = [ChatMessage::user("first turn")];
+
+    assert!(first.is_user_initiated(&messages));
+    assert!(second.is_user_initiated(&messages));
+    first
+        .user_turn_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(!first.is_user_initiated(&messages));
+    assert!(second.is_user_initiated(&messages));
+}
+
+#[test]
 fn official_transport_reports_internal_tool_handling() {
     let provider = CopilotApiProvider::with_official_process(
         CopilotOfficialCliProcess::with_command(PathBuf::from("copilot")),
@@ -56,19 +96,6 @@ fn official_transport_reports_internal_tool_handling() {
     assert!(provider.handles_tools_internally());
     assert!(!provider.supports_compaction());
     assert!(provider.set_reasoning_effort("high").is_err());
-}
-
-#[test]
-fn official_cli_configuration_info_is_not_assistant_text() {
-    assert!(is_official_cli_configuration_info(
-        "Info: Disabled tools: bash, edit"
-    ));
-    assert!(is_official_cli_configuration_info(
-        "Info: Unknown tool name in the tool allowlist: \"missing\""
-    ));
-    assert!(!is_official_cli_configuration_info(
-        "Informational assistant response"
-    ));
 }
 
 #[test]
