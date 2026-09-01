@@ -74,7 +74,7 @@ async fn fake_official_cli_covers_command_env_handshake_stream_usage_and_permiss
     process
         .env
         .insert("JCODE_FAKE_COPILOT_ACP_PERMISSION".into(), "1".into());
-    let provider = CopilotApiProvider::with_official_process(process);
+    let provider = CopilotApiProvider::with_official_process(process.clone());
     provider.complete_init_without_tier_detection();
 
     provider.prefetch_models().await.unwrap();
@@ -103,7 +103,7 @@ async fn fake_official_cli_covers_command_env_handshake_stream_usage_and_permiss
     ));
     assert!(
         events.iter().any(
-            |event| matches!(event, StreamEvent::SessionId(id) if id == "fake-copilot-session")
+            |event| matches!(event, StreamEvent::SessionId(id) if id == "jcode-copilot-acp-v1:safe:fake-copilot-session")
         )
     );
     assert!(
@@ -225,7 +225,7 @@ async fn official_failure_surfaces_stderr_without_native_fallback() {
     process
         .env
         .insert("JCODE_FAKE_COPILOT_ACP_FAIL".into(), "1".into());
-    let provider = CopilotApiProvider::with_official_process(process);
+    let provider = CopilotApiProvider::with_official_process(process.clone());
     provider.complete_init_without_tier_detection();
 
     let error = provider.complete_simple("fail", "").await.unwrap_err();
@@ -525,7 +525,7 @@ async fn request_context_sets_child_and_acp_cwd_without_cross_session_leakage() 
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn established_session_continues_after_model_switch_via_load_and_set_model() {
+async fn established_session_reuses_one_child_and_applies_model_switch() {
     let temp = tempfile::tempdir().unwrap();
     let working_dir = temp.path().join("session");
     std::fs::create_dir_all(&working_dir).unwrap();
@@ -565,10 +565,31 @@ async fn established_session_continues_after_model_switch_via_load_and_set_model
             .iter()
             .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
     );
+    let third = complete_in_dir(
+        &provider,
+        &working_dir,
+        &[
+            Message::user("first turn"),
+            Message::assistant_text("OK"),
+            Message::user("second turn"),
+            Message::assistant_text("OK"),
+            Message::user("third turn"),
+        ],
+        Some(&session_id),
+    )
+    .await;
+    assert!(
+        third
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+    );
 
     let requests = std::fs::read_to_string(log).unwrap();
+    assert_eq!(requests.matches("\"process\"").count(), 1, "{requests}");
+    assert_eq!(requests.matches("\"method\":\"session/new\"").count(), 1);
+    assert_eq!(requests.matches("\"method\":\"session/prompt\"").count(), 3);
     assert!(
-        requests.contains("\"method\":\"session/load\""),
+        !requests.contains("\"method\":\"session/load\""),
         "{requests}"
     );
     assert!(
@@ -579,6 +600,253 @@ async fn established_session_continues_after_model_switch_via_load_and_set_model
         requests.contains("\"method\":\"session/set_model\""),
         "{requests}"
     );
+    assert_eq!(
+        requests.matches("\"method\":\"session/set_model\"").count(),
+        1
+    );
+    assert!(
+        requests.contains("\"modelId\":\"gpt-5-mini\""),
+        "{requests}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_cross_process_session_load_recovers_once_with_replaced_session_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let working_dir = temp.path().join("session");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    let log = temp.path().join("stale-session.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND".into(), "1".into());
+    let provider = CopilotApiProvider::with_official_process(process.clone());
+    provider.complete_init_without_tier_detection();
+
+    let first = complete_in_dir(
+        &provider,
+        &working_dir,
+        &[Message::user("first turn")],
+        None,
+    )
+    .await;
+    let stale_session_id = first
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::SessionId(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("first turn session id");
+    assert_eq!(
+        stale_session_id,
+        "jcode-copilot-acp-v1:safe:fake-copilot-session"
+    );
+    drop(provider);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let second = complete_in_dir(
+        &provider,
+        &working_dir,
+        &[
+            Message::user("first turn"),
+            Message::assistant_text("OK"),
+            Message::user("second turn"),
+        ],
+        Some(&stale_session_id),
+    )
+    .await;
+    let recovered_session_id = second
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::SessionId(id) => Some(id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("recovered session id missing from {second:?}"));
+    assert_eq!(
+        recovered_session_id,
+        "jcode-copilot-acp-v1:safe:recovered-copilot-session"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "OK"))
+    );
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 1);
+    assert_eq!(requests.matches("\"method\":\"session/new\"").count(), 2);
+    assert_eq!(requests.matches("second turn").count(), 1);
+    let recovered_prompt = requests
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| {
+            value.get("method").and_then(serde_json::Value::as_str) == Some("session/prompt")
+                && value.to_string().contains("second turn")
+        })
+        .expect("recovered prompt request");
+    let prompt = recovered_prompt["params"]["prompt"].as_array().unwrap();
+    assert_eq!(prompt.len(), 2, "{recovered_prompt}");
+    assert_eq!(prompt[1]["type"], "text");
+    assert_eq!(prompt[1]["text"], "second turn");
+    assert_eq!(
+        prompt[0]["type"], "resource",
+        "history must be an embedded read-only resource: {recovered_prompt}"
+    );
+    assert!(
+        prompt[0]
+            .to_string()
+            .contains("READ-ONLY historical transcript"),
+        "{recovered_prompt}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn crashed_child_restarts_and_recovers_safe_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let working_dir = temp.path().join("session");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    let log = temp.path().join("crashed-child.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND".into(), "1".into());
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_EXIT_AFTER_PROMPT".into(),
+        "1".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let first = complete_in_dir(
+        &provider,
+        &working_dir,
+        &[Message::user("first turn")],
+        None,
+    )
+    .await;
+    let persisted = first
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            StreamEvent::SessionId(id) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("persisted session id");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let messages = [
+        Message::user("first turn"),
+        Message::assistant_text("OK"),
+        Message::user("second turn"),
+    ];
+    let request_context = ProviderRequestContext::new(Some(working_dir.clone()));
+    let mut crashed_stream = provider
+        .complete_split_with_context(
+            &messages,
+            &[one_tool()],
+            "",
+            "",
+            Some(&persisted),
+            &request_context,
+        )
+        .await
+        .unwrap();
+    let mut crash_error = None;
+    while let Some(event) = crashed_stream.next().await {
+        if let Err(error) = event {
+            crash_error = Some(error.to_string());
+        }
+    }
+    assert!(
+        crash_error
+            .as_deref()
+            .is_some_and(|error| error.contains("official Copilot CLI request failed")),
+        "{crash_error:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let second = complete_in_dir(&provider, &working_dir, &messages, Some(&persisted)).await;
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "OK"))
+    );
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert_eq!(requests.matches("\"process\"").count(), 2, "{requests}");
+    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 1);
+    assert_eq!(requests.matches("\"method\":\"session/new\"").count(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unmarked_stale_history_replaces_id_once_without_replaying_current_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let working_dir = temp.path().join("session");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    let log = temp.path().join("unsafe-stale-session.jsonl");
+    let mut process = fake_process(&log);
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND".into(), "1".into());
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+    let request_context = ProviderRequestContext::new(Some(working_dir.clone()));
+    let messages = [
+        Message::user("old instruction"),
+        Message::assistant_text("old answer"),
+        Message::user("current prompt"),
+    ];
+    let mut stream = provider
+        .complete_split_with_context(
+            &messages,
+            &[one_tool()],
+            "",
+            "",
+            Some("fake-copilot-session"),
+            &request_context,
+        )
+        .await
+        .unwrap();
+    let mut replacement = None;
+    let mut boundary_error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::SessionId(id)) => replacement = Some(id),
+            Ok(_) => {}
+            Err(error) => boundary_error = Some(error.to_string()),
+        }
+    }
+    let replacement = replacement.expect("replacement session id");
+    assert_eq!(
+        replacement,
+        "jcode-copilot-acp-v1:unsafe:recovered-copilot-session"
+    );
+    assert!(
+        boundary_error
+            .as_deref()
+            .is_some_and(|error| error.contains("resend the current message once")),
+        "{boundary_error:?}"
+    );
+    let requests = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 1);
+    assert_eq!(requests.matches("\"method\":\"session/new\"").count(), 1);
+    assert!(
+        !requests.contains("\"method\":\"session/prompt\""),
+        "unsafe stale turn must not be consumed: {requests}"
+    );
+    assert!(!requests.contains("current prompt"), "{requests}");
+
+    provider.set_model("gpt-5-mini").unwrap();
+    let retry = complete_in_dir(&provider, &working_dir, &messages, Some(&replacement)).await;
+    assert!(
+        retry
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "OK"))
+    );
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 1);
+    assert_eq!(requests.matches("current prompt").count(), 1);
     assert!(
         requests.contains("\"modelId\":\"gpt-5-mini\""),
         "{requests}"
@@ -654,7 +922,7 @@ async fn multiprovider_forks_isolate_two_agents_and_resumed_acp_model_state() {
 
     let requests = std::fs::read_to_string(&log).unwrap();
     assert_eq!(requests.matches("\"method\":\"session/new\"").count(), 1);
-    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 1);
+    assert_eq!(requests.matches("\"method\":\"session/load\"").count(), 0);
     assert!(
         !requests.contains("\"method\":\"session/set_model\""),
         "agent B inherited agent A's model switch: {requests}"

@@ -72,6 +72,24 @@
   continued candidate lines, exact EOF removal, and newline-delimited marker
   success. Internal tool smoke validates the tool lifecycle first, then performs
   a separate no-tool marker confirmation through the same line cleaner.
+- Live diagnosis confirmed official Copilot ACP sessions are process-local:
+  `session/load` returns typed `ResourceNotFound` in a new process with both the
+  same and a different cwd, while the original process reports the session is
+  already loaded.
+- Each forked Jcode session now owns one persistent ACP worker/child across
+  normal turns. Persisted provider IDs carry proven-safe/unsafe history state;
+  typed stale IDs are replaced once instead of retried forever.
+- Safe text-only history is attached to a replacement ACP session as an
+  embedded READ-ONLY resource and only the current user prompt is sent as text.
+  Legacy/unmarked or side-effect history is never replayed: Jcode creates and
+  persists a replacement ID, returns one explicit resend boundary, then the
+  next turn continues without another stale load.
+- Fixture coverage includes one-child multi-turn/model switching, provider
+  restart, child crash then recovery, safe resource recovery, unmarked history
+  refusal, current-prompt-once, fork/cwd isolation, cancellation, and cleanup.
+- Real isolated-server reproduction completed `TURN1_OK`, naturally ended the
+  per-run ACP child lifecycle, then resumed the same local session with
+  `TURN2_OK` and `TURN3_OK` without a repeated NotFound loop.
 - Provider-tool validation now enforces monotonic per-ID transitions:
   Pending→Completed and InProgress→Completed pass; Completed-only,
   Pending→Completed→InProgress, failed, incomplete, and wrong-kind sequences

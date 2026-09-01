@@ -17,6 +17,7 @@ fn make_test_provider(fetched: Vec<String>) -> CopilotApiProvider {
         premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         reasoning_effort: Arc::new(RwLock::new(None)),
+        official_runtime: Arc::new(Mutex::new(None)),
         created_at: std::time::Instant::now(),
     }
 }
@@ -85,6 +86,46 @@ fn one_per_session_forks_each_start_with_their_own_first_turn() {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     assert!(!first.is_user_initiated(&messages));
     assert!(second.is_user_initiated(&messages));
+}
+
+#[test]
+fn stale_recovery_only_embeds_proven_safe_text_history() {
+    let safe_messages = [
+        ChatMessage::user("old question"),
+        ChatMessage::assistant_text("old answer"),
+        ChatMessage::user("current question"),
+    ];
+    let safe = build_stale_recovery_context(&safe_messages, "", OfficialHistorySafety::Safe);
+    assert!(safe.allowed);
+    assert!(
+        safe.resource
+            .as_deref()
+            .is_some_and(|resource| resource.contains("READ-ONLY historical transcript"))
+    );
+
+    let unknown = build_stale_recovery_context(&safe_messages, "", OfficialHistorySafety::Unknown);
+    assert!(!unknown.allowed);
+    assert!(unknown.resource.is_none());
+
+    let side_effect_messages = [
+        ChatMessage::user("old question"),
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "bash".to_string(),
+                input: json!({"command":"touch marker"}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        ChatMessage::user("current question"),
+    ];
+    let side_effect =
+        build_stale_recovery_context(&side_effect_messages, "", OfficialHistorySafety::Safe);
+    assert!(!side_effect.allowed);
+    assert!(side_effect.resource.is_none());
 }
 
 #[test]

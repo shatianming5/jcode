@@ -47,6 +47,7 @@ fn main() {
 
     let stdin = std::io::stdin();
     let mut lines = BufReader::new(stdin.lock()).lines();
+    let mut stale_load_seen = false;
     while let Some(line) = lines.next() {
         let line = line.expect("read request");
         let value: Value = serde_json::from_str(&line).expect("valid JSON-RPC request");
@@ -71,7 +72,11 @@ fn main() {
             "session/new" => response(
                 id,
                 json!({
-                    "sessionId":"fake-copilot-session",
+                    "sessionId": if stale_load_seen {
+                        "recovered-copilot-session"
+                    } else {
+                        "fake-copilot-session"
+                    },
                     "models": {
                         "currentModelId":"claude-sonnet-4.6",
                         "availableModels":[
@@ -82,6 +87,18 @@ fn main() {
                 }),
             ),
             "session/load" => {
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND").is_some() {
+                    stale_load_seen = true;
+                    send(json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "error":{
+                            "code":-32002,
+                            "message":"Resource not found: Session fake-copilot-session not found"
+                        }
+                    }));
+                    continue;
+                }
                 send(json!({
                     "jsonrpc":"2.0",
                     "method":"session/update",
@@ -212,6 +229,9 @@ fn main() {
                         }
                     }),
                 );
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_EXIT_AFTER_PROMPT").is_some() {
+                    return;
+                }
             }
             "session/cancel" => break,
             other => panic!("unexpected ACP method: {other}"),
