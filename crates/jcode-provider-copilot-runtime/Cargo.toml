@@ -8,7 +8,14 @@ description = "GitHub Copilot provider runtime (direct API, tier detection, prem
 name = "jcode_provider_copilot_runtime"
 path = "src/lib.rs"
 
+[[bin]]
+name = "jcode-fake-copilot-acp"
+path = "src/bin/fake_official_cli.rs"
+test = false
+bench = false
+
 [dependencies]
+agent-client-protocol = { version = "=0.10.4", features = ["unstable_session_model", "unstable_session_usage"] }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -25,11 +32,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde_json = "1"
 dirs = "5"
 futures = "0.3"
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { version = "1", features = ["io-util", "process", "sync", "time", "rt"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # The migrated copilot tests use jcode-base's test-env sandbox.
+jcode-app-core = { path = "../jcode-app-core", default-features = false }
 jcode-base = { path = "../jcode-base", default-features = false, features = ["test-support"] }
 tempfile = "3"

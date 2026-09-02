@@ -1,6 +1,38 @@
 use super::*;
 
 impl Agent {
+    pub(super) fn provider_turn_context_since(
+        &self,
+        request_boundary: usize,
+    ) -> Option<crate::provider::ProviderTurnContext> {
+        // The boundary is captured immediately before one provider request.
+        // Only user blocks appended by that request's continuations are read;
+        // prior transcript history is never searched for a "latest" prompt.
+        let messages = self.session.messages.get(request_boundary..)?;
+        let content = messages
+            .iter()
+            .filter(|message| message.role == crate::message::Role::User)
+            .flat_map(|message| message.content.iter().cloned())
+            .collect::<Vec<_>>();
+        (!content.is_empty()).then(|| crate::provider::ProviderTurnContext::from_content(content))
+    }
+
+    pub(super) fn persist_provider_session_id(&mut self, session_id: String) -> Result<()> {
+        if self.provider_session_id.as_deref() == Some(session_id.as_str())
+            && self.session.provider_session_id.as_deref() == Some(session_id.as_str())
+        {
+            return Ok(());
+        }
+        let previous_agent = self.provider_session_id.replace(session_id.clone());
+        let previous_session = self.session.provider_session_id.replace(session_id);
+        if let Err(error) = self.session.save() {
+            self.provider_session_id = previous_agent;
+            self.session.provider_session_id = previous_session;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn set_premium_mode(&self, mode: crate::provider::copilot::PremiumMode) {
         self.provider.set_premium_mode(mode);
     }

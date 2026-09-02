@@ -285,6 +285,19 @@ impl AuthTestSmokeKind {
         }
     }
 
+    fn success_detail_for_choice(
+        self,
+        choice: &super::provider_init::ProviderChoice,
+    ) -> &'static str {
+        if matches!(self, Self::Tool)
+            && matches!(choice, super::provider_init::ProviderChoice::Copilot)
+            && crate::provider::copilot::official_cli_selected()
+        {
+            return "Official Copilot CLI returned AUTH_TEST_OK after a validated read-only ACP-internal tool status event.";
+        }
+        self.success_detail()
+    }
+
     fn failure_detail(self, output: &str) -> String {
         match self {
             Self::Provider => {

@@ -7,6 +7,60 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 pub const COPILOT_API_VERSION: &str = "2025-04-01";
+pub const COPILOT_TRANSPORT_ENV: &str = "JCODE_COPILOT_TRANSPORT";
+pub const COPILOT_CLI_PATH_ENV: &str = "JCODE_COPILOT_CLI_PATH";
+
+pub fn official_cli_path_from_env() -> Result<std::path::PathBuf, String> {
+    std::env::var_os(COPILOT_CLI_PATH_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "{COPILOT_CLI_PATH_ENV} is required for official-cli transport; set it to the raw GitHub Copilot CLI binary"
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CopilotTransport {
+    #[default]
+    Native,
+    OfficialCli,
+}
+
+impl CopilotTransport {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None => Ok(Self::Native),
+            Some("native") => Ok(Self::Native),
+            Some("official-cli") => Ok(Self::OfficialCli),
+            Some(value) => Err(format!(
+                "Unsupported {COPILOT_TRANSPORT_ENV} value '{value}'; expected 'native' or 'official-cli'"
+            )),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var(COPILOT_TRANSPORT_ENV) {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{COPILOT_TRANSPORT_ENV} must contain valid UTF-8"))
+            }
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::OfficialCli => "official-cli",
+        }
+    }
+
+    pub const fn uses_native_credentials(self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
 
 /// Default model id. This must be a **Copilot catalog** id (dot-separated,
 /// e.g. `claude-sonnet-4.6`), not the Anthropic-native hyphenated form: the
@@ -35,6 +89,39 @@ pub const FALLBACK_MODELS: &[&str] = &[
     "gpt-5-mini",
     "gpt-4.1",
 ];
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_transport_defaults_to_native() {
+        assert_eq!(
+            CopilotTransport::parse(None).unwrap(),
+            CopilotTransport::Native
+        );
+    }
+
+    #[test]
+    fn copilot_transport_accepts_supported_values() {
+        assert_eq!(
+            CopilotTransport::parse(Some("native")).unwrap(),
+            CopilotTransport::Native
+        );
+        assert_eq!(
+            CopilotTransport::parse(Some("official-cli")).unwrap(),
+            CopilotTransport::OfficialCli
+        );
+    }
+
+    #[test]
+    fn copilot_transport_rejects_unknown_values() {
+        let error = CopilotTransport::parse(Some("auto")).unwrap_err();
+        assert!(error.contains(COPILOT_TRANSPORT_ENV));
+        assert!(error.contains("native"));
+        assert!(error.contains("official-cli"));
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedCatalog {

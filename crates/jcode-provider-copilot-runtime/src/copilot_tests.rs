@@ -2,21 +2,215 @@ use super::*;
 
 fn make_test_provider(fetched: Vec<String>) -> CopilotApiProvider {
     CopilotApiProvider {
-        client: jcode_base::provider::shared_http_client(),
+        backend: CopilotBackend::Native {
+            client: jcode_base::provider::shared_http_client(),
+            github_token: "test-token".to_string(),
+            bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
+            session_id: "test-session".to_string(),
+            machine_id: "test-machine".to_string(),
+        },
         model: Arc::new(RwLock::new(DEFAULT_MODEL.to_string())),
-        github_token: "test-token".to_string(),
-        bearer_token: Arc::new(tokio::sync::RwLock::new(None)),
         fetched_models: Arc::new(RwLock::new(fetched)),
         catalog_source: Arc::new(RwLock::new(CatalogSource::Live)),
-        session_id: "test-session".to_string(),
-        machine_id: "test-machine".to_string(),
         init_ready: Arc::new(tokio::sync::Notify::new()),
         init_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         premium_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         user_turn_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         reasoning_effort: Arc::new(RwLock::new(None)),
+        official_runtime: Arc::new(Mutex::new(None)),
         created_at: std::time::Instant::now(),
     }
+}
+
+#[test]
+fn native_transport_regression_and_construction_lock() {
+    let provider = make_test_provider(Vec::new());
+    assert_eq!(provider.transport().as_deref(), Some("native"));
+    assert_eq!(
+        provider.available_transports(),
+        vec!["native", "official-cli"]
+    );
+    assert!(provider.set_transport("native").is_ok());
+    assert!(provider.set_transport("official-cli").is_err());
+    assert!(!provider.handles_tools_internally());
+}
+
+#[test]
+fn native_copilot_fork_keeps_model_state_session_local() {
+    let provider = make_test_provider(Vec::new());
+    provider.set_model("claude-sonnet-4.6").unwrap();
+    let forked = provider.fork();
+
+    forked.set_model("gpt-5-mini").unwrap();
+
+    assert_eq!(forked.model(), "gpt-5-mini");
+    assert_eq!(provider.model(), "claude-sonnet-4.6");
+    assert_eq!(forked.transport().as_deref(), Some("native"));
+}
+
+#[test]
+fn copilot_forks_do_not_share_reasoning_or_premium_settings() {
+    let provider = make_test_provider(Vec::new());
+    provider.set_model("claude-sonnet-5").unwrap();
+    provider.set_reasoning_effort("high").unwrap();
+    provider.set_premium_mode(PremiumMode::OnePerSession);
+    let first = provider.fork();
+    let second = provider.fork();
+
+    first.set_reasoning_effort("low").unwrap();
+    first.set_premium_mode(PremiumMode::Zero);
+
+    assert_eq!(first.reasoning_effort().as_deref(), Some("low"));
+    assert_eq!(first.premium_mode(), PremiumMode::Zero);
+    assert_eq!(second.reasoning_effort().as_deref(), Some("high"));
+    assert_eq!(second.premium_mode(), PremiumMode::OnePerSession);
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("high"));
+    assert_eq!(provider.premium_mode(), PremiumMode::OnePerSession);
+}
+
+#[test]
+fn one_per_session_forks_each_start_with_their_own_first_turn() {
+    let provider = make_test_provider(Vec::new());
+    provider.set_premium_mode(PremiumMode::OnePerSession);
+    provider
+        .user_turn_count
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let first = provider.fork_for_session();
+    let second = provider.fork_for_session();
+    let messages = [ChatMessage::user("first turn")];
+
+    assert!(first.is_user_initiated(&messages));
+    assert!(second.is_user_initiated(&messages));
+    first
+        .user_turn_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(!first.is_user_initiated(&messages));
+    assert!(second.is_user_initiated(&messages));
+}
+
+#[test]
+fn stale_recovery_uses_only_current_system_and_current_user_prompt() {
+    let current_turn = ProviderTurnContext::new("current prompt");
+    let prompt = build_stale_fresh_prompt("current system", "", Some(&current_turn)).unwrap();
+
+    assert!(prompt.contains("current system"));
+    assert_eq!(prompt.matches("current prompt").count(), 1);
+    assert!(!prompt.contains("old question"));
+    assert!(!prompt.contains("touch marker"));
+    assert!(!prompt.contains("failed prompt"));
+}
+
+#[test]
+fn stale_recovery_refuses_to_infer_the_current_turn_from_history() {
+    let error = build_stale_fresh_prompt("current system", "", None).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("explicit current user prompt is required"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn typed_current_turn_rejects_interrupt_images_instead_of_ignoring_them() {
+    let current_turn = ProviderTurnContext::from_content(vec![
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "aW1hZ2U=".to_string(),
+        },
+        ContentBlock::Text {
+            text: "interrupt text".to_string(),
+            cache_control: None,
+        },
+    ]);
+
+    let error = build_stale_fresh_prompt("system", "", Some(&current_turn)).unwrap_err();
+
+    assert!(error.to_string().contains("Image input is not supported"));
+}
+
+#[test]
+fn official_runtime_lifecycle_is_monotonic_and_admission_errors_are_retryable() {
+    let lifecycle = OfficialRuntimeLifecycle::new();
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Healthy);
+
+    lifecycle.begin_cancelling();
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Cancelling);
+    lifecycle.close();
+    lifecycle.begin_cancelling();
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Closed);
+    assert!(jcode_provider_core::is_transient_transport_error(
+        &official_runtime_retryable_error().to_string()
+    ));
+}
+
+#[tokio::test]
+async fn ready_acp_response_wins_over_simultaneous_io_close() {
+    let cancel = OfficialTurnCancellation::new();
+    let lifecycle = OfficialRuntimeLifecycle::new();
+    let io_health = OfficialIoHealth::new();
+    io_health.mark_closed();
+
+    let result = wait_for_turn_request(
+        "test/ready-response",
+        Duration::from_secs(1),
+        async { Ok::<_, acp::Error>(()) },
+        &cancel,
+        &lifecycle,
+        &io_health,
+    )
+    .await;
+
+    assert!(matches!(result, Ok(Ok(()))), "response was lost to EOF");
+}
+
+#[test]
+fn cancelled_generation_cannot_commit_a_completed_setup_response() {
+    let lifecycle = OfficialRuntimeLifecycle::new();
+    let routing = OfficialTurnRouting::default();
+    let (tx, _rx) = mpsc::channel(1);
+    let turn = OfficialTurnCommand {
+        generation: 7,
+        selected_model: "test-model".to_string(),
+        resume_session_id: None,
+        prompt: "prompt".to_string(),
+        fresh_prompt: "prompt".to_string(),
+        tx,
+        cancel: OfficialTurnCancellation::new(),
+    };
+    lifecycle.activate_generation(turn.generation);
+    routing.activate(&turn);
+    assert!(official_turn_can_commit(&turn, &lifecycle, &routing));
+
+    turn.cancel.request();
+
+    assert!(!official_turn_can_commit(&turn, &lifecycle, &routing));
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Cancelling);
+}
+
+#[test]
+fn legacy_official_session_markers_only_unwrap_the_upstream_id() {
+    assert_eq!(
+        parse_official_session_id("jcode-copilot-acp-v1:safe:upstream-one"),
+        "upstream-one"
+    );
+    assert_eq!(
+        parse_official_session_id("jcode-copilot-acp-v1:unsafe:upstream-two"),
+        "upstream-two"
+    );
+    assert_eq!(parse_official_session_id("plain-id"), "plain-id");
+}
+
+#[test]
+fn official_transport_reports_internal_tool_handling() {
+    let provider = CopilotApiProvider::with_official_process(
+        CopilotOfficialCliProcess::with_command(PathBuf::from("copilot")),
+    );
+    assert_eq!(provider.transport().as_deref(), Some("official-cli"));
+    assert!(provider.handles_tools_internally());
+    assert!(!provider.supports_compaction());
+    assert!(provider.set_reasoning_effort("high").is_err());
 }
 
 #[test]

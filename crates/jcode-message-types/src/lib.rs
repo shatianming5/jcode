@@ -662,6 +662,31 @@ impl std::fmt::Display for ConnectionPhase {
     }
 }
 
+/// Structured kind for a tool executed inside a provider-managed runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderToolKind {
+    Read,
+    Search,
+    Edit,
+    Delete,
+    Move,
+    Execute,
+    Fetch,
+    Think,
+    SwitchMode,
+    Other,
+}
+
+/// Structured lifecycle status for a provider-managed tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Other,
+}
+
 /// Streaming event from provider.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -730,6 +755,15 @@ pub enum StreamEvent {
     ConnectionPhase { phase: ConnectionPhase },
     /// Provider-supplied human-readable transport detail for the status line
     StatusDetail { detail: String },
+    /// Structured lifecycle update for a tool executed inside the provider.
+    /// Ordinary UI consumers may ignore this and continue rendering
+    /// [`StreamEvent::StatusDetail`].
+    ProviderToolUpdate {
+        id: String,
+        kind: Option<ProviderToolKind>,
+        status: Option<ProviderToolStatus>,
+        title: Option<String>,
+    },
     /// Error occurred
     Error {
         message: String,

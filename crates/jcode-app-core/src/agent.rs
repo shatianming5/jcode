@@ -7,6 +7,8 @@ mod interrupts;
 mod messages;
 mod prompting;
 mod provider;
+#[cfg(test)]
+mod provider_session_tests;
 mod response_recovery;
 mod status;
 mod streaming;
@@ -426,6 +428,7 @@ impl Agent {
             tool_selection.allowed_tools,
             tool_selection.disabled_tools,
         );
+        agent.provider_session_id = agent.session.provider_session_id.clone();
         agent.session.mark_active();
         if agent.session.provider_key.is_none() {
             agent.session.provider_key = agent.provider_key_for_new_session();
@@ -543,11 +546,12 @@ impl Agent {
         }
     }
 
+    pub(super) fn memory_injection_context(memory: &crate::memory::PendingMemory) -> String {
+        format!("<system-reminder>\n{}\n</system-reminder>", memory.prompt)
+    }
+
     fn memory_injection_message(memory: &crate::memory::PendingMemory) -> Message {
-        Message::user(&format!(
-            "<system-reminder>\n{}\n</system-reminder>",
-            memory.prompt
-        ))
+        Message::user(&Self::memory_injection_context(memory))
     }
 
     pub(super) fn prepare_memory_injection_message(

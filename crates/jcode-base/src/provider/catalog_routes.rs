@@ -556,10 +556,10 @@ fn append_copilot_routes(provider: &MultiProvider, routes: &mut Vec<ModelRoute>)
         for model in copilot_models {
             routes.push(build_copilot_route(&model, true, detail.clone()));
         }
-        if copilot_models_empty && copilot::has_credentials() {
+        if copilot_models_empty && copilot::is_configured() {
             routes.push(build_copilot_route("copilot models", false, detail));
         }
-    } else if copilot::has_credentials() {
+    } else if copilot::is_configured() {
         routes.push(build_copilot_route(
             "copilot models",
             false,

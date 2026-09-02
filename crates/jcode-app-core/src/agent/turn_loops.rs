@@ -28,7 +28,11 @@ impl Agent {
         pending && batch_available
     }
 
-    pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
+    pub(super) async fn run_turn(
+        &mut self,
+        print_output: bool,
+        mut provider_turn: crate::provider::ProviderTurnContext,
+    ) -> Result<String> {
         self.set_log_context();
         crate::session_metrics::record_turn(&self.session.id);
         // Mark this session as actively streaming for presence UIs (e.g. the
@@ -48,8 +52,14 @@ impl Agent {
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
+        let mut previous_request_boundary = None;
 
         loop {
+            if let Some(boundary) = previous_request_boundary.take()
+                && let Some(next_turn) = self.provider_turn_context_since(boundary)
+            {
+                provider_turn = next_turn;
+            }
             // Do not start another provider request once a cancel has been
             // observed; the loop is re-entered by several recovery paths
             // (issue #732, regression of #428).
@@ -102,6 +112,7 @@ impl Agent {
 
             // Inject memory as a user message at the end (preserves cache prefix)
             let mut messages_with_memory: Vec<Message> = messages.iter().cloned().collect();
+            let mut memory_context = None;
             if let Some(memory) = memory_pending.as_ref() {
                 let memory_count = memory.count.max(1);
                 let age_ms = memory.computed_at.elapsed().as_millis() as u64;
@@ -112,6 +123,7 @@ impl Agent {
                     memory.prompt.len()
                 ));
                 let (memory_msg, _persisted) = self.prepare_memory_injection_message(memory);
+                memory_context = Some(Self::memory_injection_context(memory));
                 messages_with_memory.push(memory_msg);
             }
             if Self::should_inject_batch_nudge(
@@ -144,14 +156,19 @@ impl Agent {
             let send_messages = stamped.as_deref().unwrap_or(&messages_with_memory);
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
+            previous_request_boundary = Some(self.session.messages.len());
+            let request_context =
+                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from))
+                    .with_current_turn(provider_turn.clone().with_memory_context(memory_context));
             let mut stream = match self
                 .provider
-                .complete_split(
+                .complete_split_with_context(
                     send_messages,
                     &tools,
                     &split_prompt.static_part,
                     &split_prompt.dynamic_part,
                     self.provider_session_id.as_deref(),
+                    &request_context,
                 )
                 .await
             {
@@ -484,6 +501,7 @@ impl Agent {
                         }
                         self.last_status_detail = Some(detail);
                     }
+                    StreamEvent::ProviderToolUpdate { .. } => {}
                     StreamEvent::RetryRollback { attempt, max } => {
                         // Transient transport fault mid-stream; the provider is
                         // replaying the request. Discard this attempt's partial
@@ -528,8 +546,7 @@ impl Agent {
                         if trace {
                             eprintln!("[trace] session_id {}", sid);
                         }
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid);
+                        self.persist_provider_session_id(sid)?;
                         // We've received session_id, can exit the loop now
                         if saw_message_end {
                             break;

@@ -79,6 +79,7 @@ impl Agent {
     pub(super) async fn run_turn_streaming_mpsc(
         &mut self,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
+        mut provider_turn: crate::provider::ProviderTurnContext,
     ) -> Result<()> {
         self.set_log_context();
         // Mark this session as actively streaming for presence UIs (e.g. the
@@ -97,8 +98,14 @@ impl Agent {
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
+        let mut previous_request_boundary = None;
 
         loop {
+            if let Some(boundary) = previous_request_boundary.take()
+                && let Some(next_turn) = self.provider_turn_context_since(boundary)
+            {
+                provider_turn = next_turn;
+            }
             // Never open a new provider request after a cancel. Several paths
             // `continue` this loop (compaction retry, incomplete/stranded
             // continuation, empty-response recovery, soft-interrupt injection),
@@ -178,6 +185,7 @@ impl Agent {
 
             // Inject memory as a user message at the end (preserves cache prefix)
             let mut messages_with_memory: Vec<Message> = messages.iter().cloned().collect();
+            let mut memory_context = None;
             if let Some(memory) = memory_pending.as_ref() {
                 let memory_count = memory.count.max(1);
                 let computed_age_ms = memory.computed_at.elapsed().as_millis() as u64;
@@ -195,6 +203,7 @@ impl Agent {
                     computed_age_ms,
                 });
                 let (memory_msg, persisted) = self.prepare_memory_injection_message(memory);
+                memory_context = Some(Self::memory_injection_context(memory));
                 if !persisted {
                     ephemeral_signature_messages.push(memory_msg.clone());
                 } else {
@@ -226,6 +235,10 @@ impl Agent {
             // `ModelChanged` and resync the UI/context-limit.
             let model_at_request_start = provider.model().to_string();
             let resume_session_id = self.provider_session_id.clone();
+            previous_request_boundary = Some(self.session.messages.len());
+            let request_context =
+                crate::provider::ProviderRequestContext::new(self.working_dir().map(PathBuf::from))
+                    .with_current_turn(provider_turn.clone().with_memory_context(memory_context));
             self.last_status_detail = None;
             let _ = event_tx.send(kv_cache_request_event(
                 &cache_signature_messages,
@@ -240,12 +253,13 @@ impl Agent {
             drop(ephemeral_signature_messages);
             let mut keepalive = stream_keepalive_ticker();
             let mut stream = {
-                let mut complete_future = std::pin::pin!(provider.complete_split(
+                let mut complete_future = std::pin::pin!(provider.complete_split_with_context(
                     send_messages,
                     &tools,
                     &split_prompt.static_part,
                     &split_prompt.dynamic_part,
                     resume_session_id.as_deref(),
+                    &request_context,
                 ));
                 loop {
                     tokio::select! {
@@ -715,6 +729,7 @@ impl Agent {
                         self.last_status_detail = Some(detail.clone());
                         let _ = event_tx.send(ServerEvent::StatusDetail { detail });
                     }
+                    StreamEvent::ProviderToolUpdate { .. } => {}
                     StreamEvent::RetryRollback { attempt, max } => {
                         // A transient transport fault hit mid-stream after partial
                         // output was already emitted; the provider is replaying the
@@ -793,8 +808,7 @@ impl Agent {
                         });
                     }
                     StreamEvent::SessionId(sid) => {
-                        self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid.clone());
+                        self.persist_provider_session_id(sid.clone())?;
                         let _ = event_tx.send(ServerEvent::SessionId { session_id: sid });
                     }
                     StreamEvent::OpenAIReasoning {

@@ -117,7 +117,8 @@ impl MultiProvider {
         let has_claude_creds =
             auth::claude::load_credentials().is_ok() || anthropic::has_anthropic_api_key();
         let has_openai_creds = auth::codex::load_credentials().is_ok();
-        let has_copilot_api = provider_state.auth_status().copilot_has_api_token;
+        let has_copilot_api = provider_state.auth_status().copilot_has_api_token
+            || copilot::official_cli_configured();
         let has_antigravity_creds = auth::antigravity::load_tokens().is_ok();
         let has_gemini_creds = auth::gemini::load_tokens().is_ok() || auth::gemini::has_api_key();
         let has_cursor_creds = provider_state
@@ -179,11 +180,14 @@ impl MultiProvider {
             let provider =
                 external::instantiate_expected_external_provider(external::COPILOT_RUNTIME);
             match &provider {
-                Some(_) => crate::logging::info(&format!(
-                    "Copilot API provider initialized (direct API) in {}ms",
+                Some(provider) => crate::logging::info(&format!(
+                    "Copilot provider initialized (transport={}) in {}ms",
+                    provider
+                        .transport()
+                        .unwrap_or_else(|| "unknown".to_string()),
                     copilot_init_start.elapsed().as_millis()
                 )),
-                None => crate::logging::info("Failed to initialize Copilot API (no credentials)"),
+                None => crate::logging::info("Failed to initialize Copilot provider"),
             }
             provider
         } else {

@@ -125,3 +125,6 @@ Notes:
 - Other tool-specific importers exist for Claude Code, Codex, Gemini CLI,
   GitHub Copilot, and Cursor (see `auth/claude.rs`, `auth/codex.rs`,
   `auth/gemini.rs`, `auth/copilot.rs`, `auth/cursor.rs`).
+- With `JCODE_COPILOT_TRANSPORT=official-cli`, Copilot authentication is owned
+  by the official CLI process. Jcode checks the CLI ACP handshake but does not
+  inspect or import the CLI's token for that transport.

@@ -682,6 +682,7 @@ impl App {
                                             status_spinner_renderer.draw_full(self, terminal)?;
                                         }
                                     }
+                                    StreamEvent::ProviderToolUpdate { .. } => {}
                                     StreamEvent::MessageEnd { .. } => {
                                         self.pause_streaming_tps(true);
                                         self.stream_message_ended = true;

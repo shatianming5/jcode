@@ -1030,6 +1030,49 @@ fn test_multi_provider_with_cursor() -> MultiProvider {
     }
 }
 
+fn test_multi_provider_with_copilot() -> MultiProvider {
+    MultiProvider {
+        claude: RwLock::new(None),
+        anthropic: RwLock::new(None),
+        openai: RwLock::new(None),
+        copilot_api: RwLock::new(Some(test_copilot_runtime())),
+        antigravity: RwLock::new(None),
+        gemini: RwLock::new(None),
+        cursor: RwLock::new(None),
+        bedrock: RwLock::new(None),
+        openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
+        active: RwLock::new(ActiveProvider::Copilot),
+        use_claude_cli: false,
+        startup_notices: RwLock::new(Vec::new()),
+        initial_provider: Some(ActiveProvider::Copilot),
+        routes_memo: std::sync::Mutex::new(None),
+        post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }
+}
+
+#[test]
+fn copilot_forks_do_not_share_mutable_model_state() {
+    let template = test_multi_provider_with_copilot();
+    template
+        .set_model("copilot:claude-sonnet-4.6")
+        .expect("select initial Copilot model");
+    let first = template.fork();
+    let second = template.fork();
+
+    first
+        .set_model("copilot:gpt-5-mini")
+        .expect("switch first fork");
+
+    assert_eq!(first.model(), "gpt-5-mini");
+    assert_eq!(
+        second.model(),
+        "claude-sonnet-4.6",
+        "a headless/restored session fork must retain its own Copilot model"
+    );
+}
+
 #[test]
 fn new_session_fork_reloads_changed_config_provider_and_model() {
     with_clean_provider_test_env(|| {

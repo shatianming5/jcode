@@ -274,10 +274,23 @@ async fn run_provider_smoke_for_choice(
         let provider = super::provider_init::init_provider_for_validation(choice, model)
             .await
             .with_context(|| format!("Failed to initialize {} provider", choice.as_arg_value()))?;
-        let output = provider
-            .complete_simple(prompt, "")
+        let working_dir =
+            std::env::current_dir().context("Failed to determine auth-test working directory")?;
+        let messages = [crate::message::Message::user(prompt)];
+        let request_context = crate::provider::ProviderRequestContext::new(Some(working_dir))
+            .with_current_turn(crate::provider::ProviderTurnContext::new(prompt));
+        let mut stream = provider
+            .complete_split_with_context(&messages, &[], "", "", None, &request_context)
             .await
             .with_context(|| format!("{} provider smoke prompt failed", choice.as_arg_value()))?;
+        let mut output = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(crate::message::StreamEvent::TextDelta(text)) => output.push_str(&text),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(output.trim().to_string())
     })
     .await
@@ -295,6 +308,9 @@ async fn run_provider_tool_smoke_for_choice(
                 .with_context(|| {
                     format!("Failed to initialize {} provider", choice.as_arg_value())
                 })?;
+        if provider.handles_tools_internally() {
+            return run_internal_provider_tool_smoke(provider).await;
+        }
         registry
             .register_mcp_tools(None, None, Some("auth-test".to_string()))
             .await;
@@ -324,6 +340,222 @@ async fn run_provider_tool_smoke_for_choice(
         Ok(output.trim().to_string())
     })
     .await
+}
+
+async fn run_internal_provider_tool_smoke(
+    provider: std::sync::Arc<dyn crate::provider::Provider>,
+) -> Result<String> {
+    let working_dir =
+        std::env::current_dir().context("Failed to determine auth-test working directory")?;
+    let request_context = crate::provider::ProviderRequestContext::new(Some(working_dir.clone()))
+        .with_current_turn(crate::provider::ProviderTurnContext::new(
+            DEFAULT_AUTH_TEST_INTERNAL_TOOL_PROMPT,
+        ));
+    let tools = [crate::message::ToolDefinition {
+        name: "read".to_string(),
+        description: "Read a file without modifying it".to_string(),
+        input_schema: serde_json::json!({"type":"object"}),
+    }];
+    let messages = [crate::message::Message::user(
+        DEFAULT_AUTH_TEST_INTERNAL_TOOL_PROMPT,
+    )];
+    let mut stream = provider
+        .complete_split_with_context(&messages, &tools, "", "", None, &request_context)
+        .await
+        .context("Internal provider tool smoke failed to open a response stream")?;
+    let (_tool_output, tool_updates) = collect_internal_provider_tool_stream(&mut stream).await?;
+    validate_internal_provider_tool_lifecycle(&tool_updates)?;
+    let confirmation_messages = [crate::message::Message::user(
+        DEFAULT_AUTH_TEST_PROVIDER_PROMPT,
+    )];
+    let confirmation_context = crate::provider::ProviderRequestContext::new(Some(working_dir))
+        .with_current_turn(crate::provider::ProviderTurnContext::new(
+            DEFAULT_AUTH_TEST_PROVIDER_PROMPT,
+        ));
+    let mut confirmation_stream = provider
+        .complete_split_with_context(
+            &confirmation_messages,
+            &[],
+            "",
+            "",
+            None,
+            &confirmation_context,
+        )
+        .await
+        .context("Internal provider tool smoke marker confirmation failed to open a stream")?;
+    let (confirmation, _) =
+        collect_internal_provider_tool_stream(&mut confirmation_stream).await?;
+    if confirmation.trim() != "AUTH_TEST_OK" {
+        anyhow::bail!(
+            "internal tool smoke marker confirmation was {:?}, expected exactly AUTH_TEST_OK",
+            confirmation.trim()
+        );
+    }
+    Ok(confirmation.trim().to_string())
+}
+
+async fn collect_internal_provider_tool_stream(
+    stream: &mut crate::provider::EventStream,
+) -> Result<(String, Vec<InternalToolUpdate>)> {
+    let mut text_cleaner = AuthTestTextCleaner::default();
+    let mut tool_updates = Vec::new();
+    while let Some(event) = stream.next().await {
+        match event? {
+            crate::message::StreamEvent::TextDelta(text) => {
+                text_cleaner.push_chunk(&text);
+            }
+            crate::message::StreamEvent::ProviderToolUpdate {
+                id, kind, status, ..
+            } => {
+                tool_updates.push(InternalToolUpdate { id, kind, status });
+            }
+            _ => {}
+        }
+    }
+    let output = text_cleaner.finish();
+    Ok((output, tool_updates))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalToolUpdate {
+    id: String,
+    kind: Option<crate::message::ProviderToolKind>,
+    status: Option<crate::message::ProviderToolStatus>,
+}
+
+#[derive(Default)]
+struct AuthTestTextCleaner {
+    pending: String,
+    output: String,
+}
+
+impl AuthTestTextCleaner {
+    fn push_chunk(&mut self, text: &str) {
+        self.pending.push_str(text);
+        while let Some(newline) = self.pending.find('\n') {
+            let line = self.pending[..newline].to_string();
+            self.pending.drain(..=newline);
+            if !is_exact_auth_test_configuration_line(&line) {
+                self.output.push_str(&line);
+                self.output.push('\n');
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if !self.pending.is_empty() && !is_exact_auth_test_configuration_line(&self.pending) {
+            self.output.push_str(&self.pending);
+        }
+        self.output
+    }
+}
+
+fn is_exact_auth_test_configuration_line(line: &str) -> bool {
+    jcode_provider_copilot_runtime::is_official_cli_configuration_notice(line)
+}
+
+#[cfg(test)]
+fn validate_internal_provider_tool_smoke(
+    updates: &[InternalToolUpdate],
+    output: &str,
+) -> Result<()> {
+    if output.trim() != "AUTH_TEST_OK" {
+        anyhow::bail!(
+            "internal tool smoke final response was {:?}, expected exactly AUTH_TEST_OK",
+            output.trim()
+        );
+    }
+    validate_internal_provider_tool_lifecycle(updates)
+}
+
+fn validate_internal_provider_tool_lifecycle(updates: &[InternalToolUpdate]) -> Result<()> {
+    let ids = updates
+        .iter()
+        .map(|update| update.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if ids.len() != 1 {
+        anyhow::bail!(
+            "internal tool smoke expected one ACP tool call id, observed {}",
+            ids.len()
+        );
+    }
+    let id = ids.into_iter().next().unwrap_or_default();
+    let mut kind = None;
+    let mut current_status = None;
+    for update in updates.iter().filter(|update| update.id == id) {
+        if matches!(
+            current_status,
+            Some(
+                crate::message::ProviderToolStatus::Completed
+                    | crate::message::ProviderToolStatus::Failed
+            )
+        ) {
+            anyhow::bail!(
+                "internal tool smoke ACP tool {id} received an update after terminal state {current_status:?}"
+            );
+        }
+        if let Some(update_kind) = update.kind {
+            if let Some(existing) = kind
+                && existing != update_kind
+            {
+                anyhow::bail!(
+                    "internal tool smoke changed ACP tool kind for {id}: {existing:?} -> {update_kind:?}"
+                );
+            }
+            kind = Some(update_kind);
+        }
+        let Some(next_status) = update.status else {
+            continue;
+        };
+        let valid = match current_status {
+            None => matches!(
+                next_status,
+                crate::message::ProviderToolStatus::Pending
+                    | crate::message::ProviderToolStatus::InProgress
+            ),
+            Some(crate::message::ProviderToolStatus::Pending) => matches!(
+                next_status,
+                crate::message::ProviderToolStatus::Pending
+                    | crate::message::ProviderToolStatus::InProgress
+                    | crate::message::ProviderToolStatus::Completed
+                    | crate::message::ProviderToolStatus::Failed
+            ),
+            Some(crate::message::ProviderToolStatus::InProgress) => matches!(
+                next_status,
+                crate::message::ProviderToolStatus::InProgress
+                    | crate::message::ProviderToolStatus::Completed
+                    | crate::message::ProviderToolStatus::Failed
+            ),
+            Some(
+                crate::message::ProviderToolStatus::Completed
+                | crate::message::ProviderToolStatus::Failed
+                | crate::message::ProviderToolStatus::Other,
+            ) => false,
+        };
+        if !valid {
+            anyhow::bail!(
+                "internal tool smoke ACP tool {id} made invalid status transition {current_status:?} -> {next_status:?}"
+            );
+        }
+        current_status = Some(next_status);
+    }
+    if !matches!(
+        kind,
+        Some(
+            crate::message::ProviderToolKind::Read | crate::message::ProviderToolKind::Search
+        )
+    ) {
+        anyhow::bail!("internal tool smoke used non-read-only ACP tool kind {kind:?}");
+    }
+    if current_status == Some(crate::message::ProviderToolStatus::Failed) {
+        anyhow::bail!("internal tool smoke ACP tool {id} failed");
+    }
+    if current_status != Some(crate::message::ProviderToolStatus::Completed) {
+        anyhow::bail!(
+            "internal tool smoke ACP tool {id} did not finish in completed state (final={current_status:?})"
+        );
+    }
+    Ok(())
 }
 
 fn validate_auth_test_tool_smoke_transcript(
@@ -609,6 +841,296 @@ mod auth_tool_smoke_tests {
                 }],
             ),
         ]
+    }
+
+    fn internal_update(
+        kind: Option<crate::message::ProviderToolKind>,
+        status: Option<crate::message::ProviderToolStatus>,
+    ) -> InternalToolUpdate {
+        InternalToolUpdate {
+            id: "internal-1".to_string(),
+            kind,
+            status,
+        }
+    }
+
+    fn clean_auth_test_chunks(chunks: &[&str]) -> String {
+        let mut cleaner = AuthTestTextCleaner::default();
+        for chunk in chunks {
+            cleaner.push_chunk(chunk);
+        }
+        cleaner.finish()
+    }
+
+    fn provider_tool_stream(
+        events: Vec<crate::message::StreamEvent>,
+    ) -> crate::provider::EventStream {
+        Box::pin(futures::stream::iter(
+            events.into_iter().map(Ok::<_, anyhow::Error>),
+        ))
+    }
+
+    fn valid_internal_tool_events() -> Vec<crate::message::StreamEvent> {
+        vec![
+            crate::message::StreamEvent::ProviderToolUpdate {
+                id: "internal-1".to_string(),
+                kind: Some(crate::message::ProviderToolKind::Read),
+                status: Some(crate::message::ProviderToolStatus::Pending),
+                title: Some("Reading Cargo.toml".to_string()),
+            },
+            crate::message::StreamEvent::ProviderToolUpdate {
+                id: "internal-1".to_string(),
+                kind: None,
+                status: Some(crate::message::ProviderToolStatus::Completed),
+                title: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_preserves_errors_in_original_order() {
+        let output = clean_auth_test_chunks(&[
+            "Info: Disabled tools: bash, edit\nERROR\nAUTH_TEST_OK",
+        ]);
+        assert_eq!(output, "ERROR\nAUTH_TEST_OK");
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            &output,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ERROR"), "{error}");
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_does_not_drop_candidate_before_newline() {
+        let output = clean_auth_test_chunks(&[
+            "Info: Disabled tools: bash, edit",
+            " \nAUTH_TEST_OK",
+        ]);
+        assert_eq!(
+            output,
+            "Info: Disabled tools: bash, edit \nAUTH_TEST_OK"
+        );
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            &output,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Info: Disabled tools: bash, edit "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_stream_continuation_preserves_candidate_line_and_fails() {
+        let mut events = vec![
+            crate::message::StreamEvent::TextDelta(
+                "Info: Disabled tools: bash, edit".to_string(),
+            ),
+            crate::message::StreamEvent::TextDelta(" \nAUTH_TEST_OK".to_string()),
+        ];
+        events.extend(valid_internal_tool_events());
+        let mut stream = provider_tool_stream(events);
+
+        let (output, updates) = collect_internal_provider_tool_stream(&mut stream)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output,
+            "Info: Disabled tools: bash, edit \nAUTH_TEST_OK"
+        );
+        let error = validate_internal_provider_tool_smoke(&updates, &output)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Info: Disabled tools: bash, edit "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_stream_drops_exact_notification_only_at_eof() {
+        let mut stream = provider_tool_stream(vec![crate::message::StreamEvent::TextDelta(
+            "Info: Disabled tools: bash, edit".to_string(),
+        )]);
+
+        let (output, updates) = collect_internal_provider_tool_stream(&mut stream)
+            .await
+            .unwrap();
+
+        assert!(output.is_empty());
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_stream_notification_newline_then_marker_passes() {
+        let mut events = vec![
+            crate::message::StreamEvent::TextDelta(
+                "Info: Disabled tools: bash, edit\n".to_string(),
+            ),
+            crate::message::StreamEvent::TextDelta("AUTH_TEST_OK".to_string()),
+        ];
+        events.extend(valid_internal_tool_events());
+        let mut stream = provider_tool_stream(events);
+
+        let (output, updates) = collect_internal_provider_tool_stream(&mut stream)
+            .await
+            .unwrap();
+
+        assert_eq!(output, "AUTH_TEST_OK");
+        validate_internal_provider_tool_smoke(&updates, &output).unwrap();
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_handles_notification_and_marker_chunks() {
+        assert_eq!(
+            clean_auth_test_chunks(&["Info: Disabled tools: bash, edit\n", "AUTH_TEST_OK"]),
+            "AUTH_TEST_OK"
+        );
+        assert_eq!(
+            clean_auth_test_chunks(&[
+                "Info: Disabled ",
+                "tools: bash, edit\n",
+                "AUTH_TEST_OK"
+            ]),
+            "AUTH_TEST_OK"
+        );
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_drops_exact_notification_at_eof() {
+        assert_eq!(
+            clean_auth_test_chunks(&["Info: Disabled tools: bash, edit"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn auth_test_configuration_cleaner_preserves_legitimate_info_prefix() {
+        assert_eq!(
+            clean_auth_test_chunks(&["Info: Disabled tools: legitimate"]),
+            "Info: Disabled tools: legitimate"
+        );
+    }
+
+    #[test]
+    fn internal_tool_smoke_accepts_started_read_only_tool_that_completes() {
+        validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Search),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .expect("completed read-only internal tool");
+    }
+
+    #[test]
+    fn internal_tool_smoke_accepts_in_progress_read_only_tool_that_completes() {
+        validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::InProgress),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .expect("in-progress read-only internal tool");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_failed_tool() {
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::InProgress),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Failed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_tool_that_never_completes() {
+        let error = validate_internal_provider_tool_smoke(
+            &[internal_update(
+                Some(crate::message::ProviderToolKind::Search),
+                Some(crate::message::ProviderToolStatus::Pending),
+            )],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish in completed state"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_completed_only_update() {
+        let error = validate_internal_provider_tool_smoke(
+            &[internal_update(
+                Some(crate::message::ProviderToolKind::Read),
+                Some(crate::message::ProviderToolStatus::Completed),
+            )],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid status transition"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_update_after_completed() {
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Read),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+                internal_update(None, Some(crate::message::ProviderToolStatus::InProgress)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("update after terminal state"), "{error}");
+    }
+
+    #[test]
+    fn internal_tool_smoke_rejects_completed_non_read_only_tool() {
+        let error = validate_internal_provider_tool_smoke(
+            &[
+                internal_update(
+                    Some(crate::message::ProviderToolKind::Execute),
+                    Some(crate::message::ProviderToolStatus::Pending),
+                ),
+                internal_update(None, Some(crate::message::ProviderToolStatus::Completed)),
+            ],
+            "AUTH_TEST_OK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("non-read-only"), "{error}");
     }
 
     #[test]

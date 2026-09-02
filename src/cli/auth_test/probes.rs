@@ -257,6 +257,35 @@ async fn probe_google_auth(report: &mut AuthTestProviderReport) {
 }
 
 async fn probe_copilot_auth(report: &mut AuthTestProviderReport) {
+    match crate::provider::copilot::selected_transport() {
+        Ok(crate::provider::copilot::CopilotTransport::OfficialCli) => {
+            let provider = match jcode_provider_copilot_runtime::CopilotApiProvider::new() {
+                Ok(provider) => provider,
+                Err(error) => {
+                    report.push_step("credential_probe", false, error.to_string());
+                    return;
+                }
+            };
+            report.push_step(
+                "credential_probe",
+                true,
+                "Official Copilot CLI selected; native GitHub token sources were not inspected.",
+            );
+            push_result_step(
+                report,
+                "refresh_probe",
+                provider.probe_official_cli().await,
+                |_| "Official Copilot CLI ACP capability handshake succeeded.".to_string(),
+            );
+            return;
+        }
+        Err(error) => {
+            report.push_step("credential_probe", false, error.to_string());
+            return;
+        }
+        Ok(crate::provider::copilot::CopilotTransport::Native) => {}
+    }
+
     if let Some(token) = push_result_step(
         report,
         "credential_probe",

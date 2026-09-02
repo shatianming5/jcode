@@ -306,7 +306,7 @@ fn enqueue_provider_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<Provider
         total += 1;
     }
 
-    if auth::copilot::has_copilot_credentials() {
+    if copilot_usage_is_configured() {
         tasks.spawn(async {
             fetch_copilot_usage_report().await.map(|mut report| {
                 attach_activity(&mut report, "copilot");
@@ -362,7 +362,7 @@ fn activity_source_has_dedicated_report(source_key: &str) -> bool {
     }
     match source_key {
         "openrouter" => openrouter_api_key().is_some(),
-        "copilot" => auth::copilot::has_copilot_credentials(),
+        "copilot" => copilot_usage_is_configured(),
         "antigravity" => auth::antigravity::has_cached_auth(),
         "gemini" => auth::gemini::has_api_key(),
         "cursor" => auth::cursor::has_cursor_api_key(),
@@ -381,6 +381,18 @@ fn activity_source_has_dedicated_report(source_key: &str) -> bool {
                 })
                 .unwrap_or(false)
         }
+    }
+}
+
+fn copilot_usage_is_configured() -> bool {
+    match crate::provider::copilot::selected_transport() {
+        Ok(crate::provider::copilot::CopilotTransport::OfficialCli) => {
+            crate::provider::copilot::official_cli_configured()
+        }
+        Ok(crate::provider::copilot::CopilotTransport::Native) => {
+            auth::copilot::has_copilot_credentials()
+        }
+        Err(_) => false,
     }
 }
 

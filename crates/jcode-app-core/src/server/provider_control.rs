@@ -291,21 +291,23 @@ async fn apply_auth_runtime_model_to_agent(
         }
         let provider_name = agent_guard.provider_handle().name().to_string();
         let model_request = activation.model_switch_request(&provider_name, model);
+        let previous_session_key = agent_guard.model_switch_session_key();
         let result = agent_guard.set_model_from_auth(&model_request);
-        if result.is_ok() {
-            agent_guard.reset_provider_session();
-        }
-        result.map(|_| agent_guard.provider_model())
+        result.map(|_| {
+            let provider_session =
+                agent_guard.reconcile_provider_session_after_model_switch(previous_session_key);
+            (agent_guard.provider_model(), provider_session)
+        })
     };
 
     match result {
-        Ok(resolved_model) => crate::logging::auth_event(
+        Ok((resolved_model, provider_session)) => crate::logging::auth_event(
             "auth_changed_runtime_model_applied",
             provider,
             &[
                 ("requested_model", model),
                 ("resolved_model", resolved_model.as_str()),
-                ("provider_session", "reset"),
+                ("provider_session", provider_session),
             ],
         ),
         Err(error) => {
@@ -338,22 +340,24 @@ async fn apply_auth_route_to_agent(
             );
             return;
         }
+        let previous_session_key = agent_guard.model_switch_session_key();
         let result = agent_guard.set_route_selection_from_auth(&selection);
-        if result.is_ok() {
-            agent_guard.reset_provider_session();
-        }
-        result.map(|_| agent_guard.provider_model())
+        result.map(|_| {
+            let provider_session =
+                agent_guard.reconcile_provider_session_after_model_switch(previous_session_key);
+            (agent_guard.provider_model(), provider_session)
+        })
     };
 
     match result {
-        Ok(resolved_model) => crate::logging::auth_event(
+        Ok((resolved_model, provider_session)) => crate::logging::auth_event(
             "auth_changed_global_route_applied",
             &route.provider,
             &[
                 ("requested_model", requested_model.as_str()),
                 ("resolved_model", resolved_model.as_str()),
                 ("api_method", route.api_method.as_str()),
-                ("provider_session", "reset"),
+                ("provider_session", provider_session),
             ],
         ),
         Err(error) => {
@@ -459,11 +463,12 @@ fn apply_cycle_model(
         ],
     );
     let result = {
+        let previous_session_key = agent.model_switch_session_key();
         let result = agent.set_model(&next_model);
-        if result.is_ok() {
-            agent.reset_provider_session();
-        }
-        result.map(|_| (agent.provider_model(), agent.provider_name()))
+        result.map(|_| {
+            agent.reconcile_provider_session_after_model_switch(previous_session_key);
+            (agent.provider_model(), agent.provider_name())
+        })
     };
     send_model_changed_result(id, result, current, client_event_tx);
 }
@@ -578,11 +583,12 @@ fn apply_set_model(
 
     let current = agent.provider_model();
     let result = {
+        let previous_session_key = agent.model_switch_session_key();
         let result = agent.set_model(&model);
-        if result.is_ok() {
-            agent.reset_provider_session();
-        }
-        result.map(|_| (agent.provider_model(), agent.provider_name()))
+        result.map(|_| {
+            agent.reconcile_provider_session_after_model_switch(previous_session_key);
+            (agent.provider_model(), agent.provider_name())
+        })
     };
     send_model_changed_result(id, result, current, client_event_tx);
 }
@@ -626,11 +632,12 @@ fn apply_set_route(
 
     let current = agent.provider_model();
     let result = {
+        let previous_session_key = agent.model_switch_session_key();
         let result = agent.set_route_selection(&selection);
-        if result.is_ok() {
-            agent.reset_provider_session();
-        }
-        result.map(|_| (agent.provider_model(), agent.provider_name()))
+        result.map(|_| {
+            agent.reconcile_provider_session_after_model_switch(previous_session_key);
+            (agent.provider_model(), agent.provider_name())
+        })
     };
     send_model_changed_result(id, result, current, client_event_tx);
 }

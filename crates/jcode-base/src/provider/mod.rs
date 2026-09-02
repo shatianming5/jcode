@@ -58,11 +58,11 @@ pub use jcode_provider_core::{
     CHEAPNESS_REFERENCE_OUTPUT_TOKENS, CredentialMode, DEFAULT_CONTEXT_LIMIT, EventStream,
     JCODE_USER_AGENT, ModelCapabilities, ModelCatalogRefreshSummary, ModelRoute,
     ModelRouteApiMethod, NativeCompactionResult, NativeToolResult, NativeToolResultSender,
-    PremiumMode, Provider, RouteBillingKind, RouteCheapnessEstimate, RouteCostConfidence,
-    RouteCostSource, RouteSelection, RuntimeKey, dedupe_model_routes,
-    explicit_model_provider_prefix, fresh_transport_client, inferred_reasoning_efforts,
-    model_name_for_provider, normalize_copilot_model_name, provider_from_model_key,
-    shared_http_client, summarize_model_catalog_refresh,
+    PremiumMode, Provider, ProviderRequestContext, ProviderTurnContext, RouteBillingKind,
+    RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource, RouteSelection, RuntimeKey,
+    dedupe_model_routes, explicit_model_provider_prefix, fresh_transport_client,
+    inferred_reasoning_efforts, model_name_for_provider, normalize_copilot_model_name,
+    provider_from_model_key, shared_http_client, summarize_model_catalog_refresh,
 };
 pub use jcode_provider_core::{
     FallbackPickOptions, error_looks_like_credential_failure, model_route_provider_labels_match,
@@ -612,6 +612,7 @@ impl MultiProvider {
         tools: &[ToolDefinition],
         mode: CompletionMode<'_>,
         resume_session_id: Option<&str>,
+        request_context: Option<&ProviderRequestContext>,
     ) -> Result<EventStream> {
         self.spawn_anthropic_catalog_refresh_if_needed();
         self.spawn_openai_catalog_refresh_if_needed();
@@ -714,6 +715,7 @@ impl MultiProvider {
                         system_static,
                         system_dynamic,
                         resume_session_id,
+                        request_context,
                     )
                     .await
                 }
@@ -1153,9 +1155,7 @@ impl MultiProvider {
             }
             ActiveProvider::Copilot => {
                 let Some(copilot) = self.copilot_provider() else {
-                    anyhow::bail!(
-                        "GitHub Copilot credentials not available. Run `jcode login --provider copilot` first."
-                    );
+                    anyhow::bail!(copilot::unavailable_message());
                 };
                 copilot.set_model(model)?;
                 self.set_active_provider(ActiveProvider::Copilot);
@@ -1449,11 +1449,11 @@ impl MultiProvider {
         if !already_has {
             let status = crate::auth::AuthStatus::check_fast();
             // The composition-root factory schedules tier detection itself.
-            if status.copilot_has_api_token
+            if (status.copilot_has_api_token || copilot::official_cli_configured())
                 && let Some(provider) =
                     external::instantiate_expected_external_provider(external::COPILOT_RUNTIME)
             {
-                crate::logging::info("Hot-initialized Copilot API provider after login");
+                crate::logging::info("Hot-initialized Copilot provider after auth change");
                 *self
                     .copilot_api
                     .write()
@@ -1730,6 +1730,7 @@ impl Provider for MultiProvider {
             tools,
             CompletionMode::Unified { system },
             resume_session_id,
+            None,
         )
         .await
     }
@@ -1751,6 +1752,29 @@ impl Provider for MultiProvider {
                 system_dynamic,
             },
             resume_session_id,
+            None,
+        )
+        .await
+    }
+
+    async fn complete_split_with_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_static: &str,
+        system_dynamic: &str,
+        resume_session_id: Option<&str>,
+        request_context: &ProviderRequestContext,
+    ) -> Result<EventStream> {
+        self.complete_with_failover(
+            messages,
+            tools,
+            CompletionMode::Split {
+                system_static,
+                system_dynamic,
+            },
+            resume_session_id,
+            Some(request_context),
         )
         .await
     }
@@ -1779,6 +1803,24 @@ impl Provider for MultiProvider {
             return execution.runtime_display_name();
         }
         self.name().to_string()
+    }
+
+    fn model_switch_session_key(&self) -> Option<&'static str> {
+        match self.active_provider() {
+            ActiveProvider::Copilot => self
+                .copilot_provider()
+                .and_then(|provider| provider.model_switch_session_key()),
+            _ => None,
+        }
+    }
+
+    fn supports_conversation_rewind(&self) -> bool {
+        match self.active_provider() {
+            ActiveProvider::Copilot => self
+                .copilot_provider()
+                .is_none_or(|provider| provider.supports_conversation_rewind()),
+            _ => true,
+        }
     }
 
     fn model(&self) -> String {
@@ -2523,6 +2565,7 @@ impl Provider for MultiProvider {
     fn transport(&self) -> Option<String> {
         match self.active_provider() {
             ActiveProvider::OpenAI => self.openai_provider().and_then(|o| o.transport()),
+            ActiveProvider::Copilot => self.copilot_provider().and_then(|o| o.transport()),
             _ => None,
         }
     }
@@ -2533,8 +2576,12 @@ impl Provider for MultiProvider {
                 .openai_provider()
                 .ok_or_else(|| anyhow::anyhow!("OpenAI provider not available"))?
                 .set_transport(transport),
+            ActiveProvider::Copilot => self
+                .copilot_provider()
+                .ok_or_else(|| anyhow::anyhow!(copilot::unavailable_message()))?
+                .set_transport(transport),
             _ => Err(anyhow::anyhow!(
-                "Transport switching is only supported for OpenAI models"
+                "Transport switching is only supported for OpenAI and Copilot models"
             )),
         }
     }
@@ -2543,6 +2590,10 @@ impl Provider for MultiProvider {
         match self.active_provider() {
             ActiveProvider::OpenAI => self
                 .openai_provider()
+                .map(|o| o.available_transports())
+                .unwrap_or_default(),
+            ActiveProvider::Copilot => self
+                .copilot_provider()
                 .map(|o| o.available_transports())
                 .unwrap_or_default(),
             ActiveProvider::Gemini => vec![],
@@ -2827,7 +2878,8 @@ impl Provider for MultiProvider {
             .copilot_api
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+            .as_ref()
+            .map(|provider| provider.fork());
         let antigravity_provider = self
             .antigravity
             .read()

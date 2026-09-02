@@ -15,7 +15,13 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        let _ = self.run_turn(true).await?;
+
+        let _ = self
+            .run_turn(
+                true,
+                crate::provider::ProviderTurnContext::new(user_message),
+            )
+            .await?;
         Ok(())
     }
 
@@ -41,7 +47,11 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        self.run_turn(
+            false,
+            crate::provider::ProviderTurnContext::new(user_message),
+        )
+        .await
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)
@@ -90,12 +100,28 @@ impl Agent {
         self.current_turn_system_reminder =
             system_reminder.filter(|value| !value.trim().is_empty());
 
+        let mut provider_input = images
+            .iter()
+            .map(|(media_type, data)| ContentBlock::Image {
+                media_type: media_type.clone(),
+                data: data.clone(),
+            })
+            .collect::<Vec<_>>();
+        provider_input.push(ContentBlock::Text {
+            text: user_message.to_string(),
+            cache_control: None,
+        });
         self.append_user_context_message_with_display_role(user_message, images, display_role)?;
         crate::telemetry::record_turn();
         let turn_started_at = Instant::now();
         let start_message_index = self.message_count();
         self.fire_turn_start_hook("chat");
-        let result = self.run_turn_streaming_mpsc(event_tx).await;
+        let result = self
+            .run_turn_streaming_mpsc(
+                event_tx,
+                crate::provider::ProviderTurnContext::from_content(provider_input),
+            )
+            .await;
         self.current_turn_system_reminder = None;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result
@@ -224,6 +250,23 @@ impl Agent {
         self.persist_session_best_effort("provider session reset");
     }
 
+    pub(crate) fn model_switch_session_key(&self) -> Option<&'static str> {
+        self.provider.model_switch_session_key()
+    }
+
+    pub(crate) fn reconcile_provider_session_after_model_switch(
+        &mut self,
+        previous_key: Option<&'static str>,
+    ) -> &'static str {
+        let current_key = self.provider.model_switch_session_key();
+        if previous_key.is_some() && previous_key == current_key {
+            "preserved"
+        } else {
+            self.reset_provider_session();
+            "reset"
+        }
+    }
+
     /// Rewind the conversation to a 1-based visible transcript message index.
     ///
     /// The index is interpreted against the same rendered transcript the TUI
@@ -243,6 +286,12 @@ impl Agent {
                 "Invalid message number: {}. Valid range: 1-{}",
                 message_index, message_count
             ));
+        }
+        if !self.provider.supports_conversation_rewind() {
+            return Err(
+                "Conversation rewind is not supported by the official Copilot CLI transport because ACP cannot rebuild a truncated upstream session."
+                    .to_string(),
+            );
         }
         let stored_len = targets[message_index - 1] + 1;
 

@@ -252,10 +252,11 @@ pub fn register_external_provider_runtimes() {
             Some(std::sync::Arc::new(provider) as std::sync::Arc<dyn crate::provider::Provider>)
         },
     );
-    // Copilot's constructor is fallible (needs a GitHub token) and the runtime
-    // wants tier detection scheduled right after construction, eagerly for
-    // interactive sessions and deferred for non-interactive ones. That policy
-    // lives here in the composition root so base stays provider-agnostic.
+    // Copilot's constructor resolves the configured transport exactly once.
+    // Native mode loads Jcode's GitHub token; official-cli mode only configures
+    // the raw CLI child and leaves authentication to its inherited environment.
+    // Eager interactive startup probes the selected backend; non-interactive
+    // runs defer that work to the request itself.
     crate::provider::external::register_external_provider_fallible(
         crate::provider::external::COPILOT_RUNTIME,
         || {
