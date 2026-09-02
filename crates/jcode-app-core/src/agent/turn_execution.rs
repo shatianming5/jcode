@@ -16,7 +16,12 @@ impl Agent {
             eprintln!("[trace] session_id {}", self.session.id);
         }
 
-        let _ = self.run_turn(true).await?;
+        let _ = self
+            .run_turn(
+                true,
+                crate::provider::ProviderTurnContext::new(user_message),
+            )
+            .await?;
         Ok(())
     }
 
@@ -42,7 +47,11 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        self.run_turn(
+            false,
+            crate::provider::ProviderTurnContext::new(user_message),
+        )
+        .await
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)
@@ -91,12 +100,28 @@ impl Agent {
         self.current_turn_system_reminder =
             system_reminder.filter(|value| !value.trim().is_empty());
 
+        let mut provider_input = images
+            .iter()
+            .map(|(media_type, data)| ContentBlock::Image {
+                media_type: media_type.clone(),
+                data: data.clone(),
+            })
+            .collect::<Vec<_>>();
+        provider_input.push(ContentBlock::Text {
+            text: user_message.to_string(),
+            cache_control: None,
+        });
         self.append_user_context_message_with_display_role(user_message, images, display_role)?;
         crate::telemetry::record_turn();
         let turn_started_at = Instant::now();
         let start_message_index = self.message_count();
         self.fire_turn_start_hook("chat");
-        let result = self.run_turn_streaming_mpsc(event_tx).await;
+        let result = self
+            .run_turn_streaming_mpsc(
+                event_tx,
+                crate::provider::ProviderTurnContext::from_content(provider_input),
+            )
+            .await;
         self.current_turn_system_reminder = None;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result

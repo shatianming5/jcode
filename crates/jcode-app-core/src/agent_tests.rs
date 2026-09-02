@@ -18,6 +18,63 @@ struct NativeAutoCompactionProvider;
 struct NativeCompactionStreamProvider;
 
 #[derive(Clone)]
+struct TurnContextCaptureProvider {
+    contexts: Arc<std::sync::Mutex<Vec<crate::provider::ProviderTurnContext>>>,
+}
+
+#[async_trait]
+impl Provider for TurnContextCaptureProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unreachable!("turn-context capture uses complete_split_with_context")
+    }
+
+    async fn complete_split_with_context(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system_static: &str,
+        _system_dynamic: &str,
+        _resume_session_id: Option<&str>,
+        request_context: &crate::provider::ProviderRequestContext,
+    ) -> Result<EventStream> {
+        self.contexts.lock().unwrap().push(
+            request_context
+                .current_turn
+                .clone()
+                .expect("typed turn context"),
+        );
+        let (tx, rx) = tokio_mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(StreamEvent::TextDelta("ok".to_string()))).await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "turn-context-capture"
+    }
+
+    fn model(&self) -> String {
+        "test-model".to_string()
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+#[derive(Clone)]
 struct ExplicitPinProvider {
     model: Arc<std::sync::Mutex<String>>,
     pin: Arc<std::sync::Mutex<Option<String>>>,
@@ -302,7 +359,11 @@ async fn run_turn_streaming_mpsc_emits_keepalive_while_provider_is_quiet() {
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = tokio::spawn(async move { agent.run_turn_streaming_mpsc(tx).await });
+    let task = tokio::spawn(async move {
+        agent
+            .run_turn_streaming_mpsc(tx, crate::provider::ProviderTurnContext::new("test"))
+            .await
+    });
 
     let mut saw_keepalive = false;
     let keepalive_deadline = Instant::now() + Duration::from_secs(20);
@@ -356,6 +417,43 @@ async fn run_turn_streaming_mpsc_emits_keepalive_while_provider_is_quiet() {
 }
 
 #[tokio::test]
+async fn soft_interrupt_replaces_the_next_provider_request_context_with_exact_input() {
+    let _guard = crate::storage::lock_test_env();
+    let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(TurnContextCaptureProvider {
+        contexts: Arc::clone(&contexts),
+    });
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.queue_soft_interrupt(
+        "INTERRUPT_TEXT".to_string(),
+        vec![("image/png".to_string(), "aW1hZ2U=".to_string())],
+        false,
+        SoftInterruptSource::User,
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    agent
+        .run_once_streaming_mpsc("ORIGINAL_PROMPT", Vec::new(), None, tx)
+        .await
+        .unwrap();
+
+    let contexts = contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 2, "{contexts:?}");
+    assert!(matches!(
+        &contexts[0].user_content[..],
+        [ContentBlock::Text { text, .. }] if text == "ORIGINAL_PROMPT"
+    ));
+    assert!(matches!(
+        &contexts[1].user_content[..],
+        [
+            ContentBlock::Image { media_type, data },
+            ContentBlock::Text { text, .. }
+        ] if media_type == "image/png" && data == "aW1hZ2U=" && text == "INTERRUPT_TEXT"
+    ));
+}
+
+#[tokio::test]
 async fn run_turn_streaming_mpsc_emits_native_compaction_for_client_cache_reset() {
     let _guard = crate::storage::lock_test_env();
     let provider: Arc<dyn Provider> = Arc::new(NativeCompactionStreamProvider);
@@ -370,7 +468,13 @@ async fn run_turn_streaming_mpsc_emits_native_compaction_for_client_cache_reset(
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    agent.run_turn_streaming_mpsc(tx).await.unwrap();
+    agent
+        .run_turn_streaming_mpsc(
+            tx,
+            crate::provider::ProviderTurnContext::new("compact this"),
+        )
+        .await
+        .unwrap();
 
     let mut saw_native_compaction = false;
     while let Ok(event) = rx.try_recv() {
@@ -460,7 +564,11 @@ async fn run_turn_streaming_mpsc_emits_model_changed_on_midstream_switch() {
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = tokio::spawn(async move { agent.run_turn_streaming_mpsc(tx).await });
+    let task = tokio::spawn(async move {
+        agent
+            .run_turn_streaming_mpsc(tx, crate::provider::ProviderTurnContext::new("test"))
+            .await
+    });
 
     let mut switched_model = None;
     let deadline = Instant::now() + Duration::from_secs(20);

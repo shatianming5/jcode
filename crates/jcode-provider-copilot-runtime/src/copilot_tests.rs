@@ -90,31 +90,103 @@ fn one_per_session_forks_each_start_with_their_own_first_turn() {
 
 #[test]
 fn stale_recovery_uses_only_current_system_and_current_user_prompt() {
-    let messages = [
-        ChatMessage::user("old question"),
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "bash".to_string(),
-                input: json!({"command":"touch marker"}),
-                thought_signature: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
-        ChatMessage::user("failed prompt that must not replay"),
-        ChatMessage::user("current prompt"),
-    ];
-
-    let prompt =
-        build_stale_fresh_prompt(&messages, "current system", Some("current prompt")).unwrap();
+    let current_turn = ProviderTurnContext::new("current prompt");
+    let prompt = build_stale_fresh_prompt("current system", "", Some(&current_turn)).unwrap();
 
     assert!(prompt.contains("current system"));
     assert_eq!(prompt.matches("current prompt").count(), 1);
     assert!(!prompt.contains("old question"));
     assert!(!prompt.contains("touch marker"));
     assert!(!prompt.contains("failed prompt"));
+}
+
+#[test]
+fn stale_recovery_refuses_to_infer_the_current_turn_from_history() {
+    let error = build_stale_fresh_prompt("current system", "", None).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("explicit current user prompt is required"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn typed_current_turn_rejects_interrupt_images_instead_of_ignoring_them() {
+    let current_turn = ProviderTurnContext::from_content(vec![
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "aW1hZ2U=".to_string(),
+        },
+        ContentBlock::Text {
+            text: "interrupt text".to_string(),
+            cache_control: None,
+        },
+    ]);
+
+    let error = build_stale_fresh_prompt("system", "", Some(&current_turn)).unwrap_err();
+
+    assert!(error.to_string().contains("Image input is not supported"));
+}
+
+#[test]
+fn official_runtime_lifecycle_is_monotonic_and_admission_errors_are_retryable() {
+    let lifecycle = OfficialRuntimeLifecycle::new();
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Healthy);
+
+    lifecycle.begin_cancelling();
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Cancelling);
+    lifecycle.close();
+    lifecycle.begin_cancelling();
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Closed);
+    assert!(jcode_provider_core::is_transient_transport_error(
+        &official_runtime_retryable_error().to_string()
+    ));
+}
+
+#[tokio::test]
+async fn ready_acp_response_wins_over_simultaneous_io_close() {
+    let cancel = OfficialTurnCancellation::new();
+    let lifecycle = OfficialRuntimeLifecycle::new();
+    let io_health = OfficialIoHealth::new();
+    io_health.mark_closed();
+
+    let result = wait_for_turn_request(
+        "test/ready-response",
+        Duration::from_secs(1),
+        async { Ok::<_, acp::Error>(()) },
+        &cancel,
+        &lifecycle,
+        &io_health,
+    )
+    .await;
+
+    assert!(matches!(result, Ok(Ok(()))), "response was lost to EOF");
+}
+
+#[test]
+fn cancelled_generation_cannot_commit_a_completed_setup_response() {
+    let lifecycle = OfficialRuntimeLifecycle::new();
+    let routing = OfficialTurnRouting::default();
+    let (tx, _rx) = mpsc::channel(1);
+    let turn = OfficialTurnCommand {
+        generation: 7,
+        selected_model: "test-model".to_string(),
+        resume_session_id: None,
+        prompt: "prompt".to_string(),
+        fresh_prompt: "prompt".to_string(),
+        tx,
+        cancel: OfficialTurnCancellation::new(),
+    };
+    lifecycle.activate_generation(turn.generation);
+    routing.activate(&turn);
+    assert!(official_turn_can_commit(&turn, &lifecycle, &routing));
+
+    turn.cancel.request();
+
+    assert!(!official_turn_can_commit(&turn, &lifecycle, &routing));
+    assert_eq!(lifecycle.state(), OfficialRuntimeState::Cancelling);
 }
 
 #[test]

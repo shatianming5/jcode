@@ -25,12 +25,12 @@ use jcode_provider_copilot::{
 };
 use jcode_provider_copilot::{DEFAULT_MODEL, FALLBACK_MODELS};
 pub use jcode_provider_core::PremiumMode;
-use jcode_provider_core::{EventStream, Provider, ProviderRequestContext};
+use jcode_provider_core::{EventStream, Provider, ProviderRequestContext, ProviderTurnContext};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -588,15 +588,12 @@ impl CopilotApiProvider {
             bail!("Copilot transport is not official-cli");
         };
         let process = process.clone();
-        run_on_acp_thread_with_process(
-            process,
-            |connection, _forward_updates, _event_tx, _io_health| {
-                Box::pin(async move {
-                    initialize_official_cli(&connection).await?;
-                    Ok(())
-                })
-            },
-        )
+        run_on_acp_thread_with_process(process, |connection, _routing, _io_health| {
+            Box::pin(async move {
+                initialize_official_cli(&connection).await?;
+                Ok(())
+            })
+        })
         .await
     }
 
@@ -605,23 +602,20 @@ impl CopilotApiProvider {
             bail!("Copilot transport is not official-cli");
         };
         let process = process.clone();
-        run_on_acp_thread_with_process(
-            process,
-            |connection, _forward_updates, _event_tx, _io_health| {
-                Box::pin(async move {
-                    initialize_official_cli(&connection).await?;
-                    let cwd =
-                        std::env::current_dir().context("Failed to determine working directory")?;
-                    let response = timeout_acp_request(
-                        "session/new",
-                        connection
-                            .new_session(acp::NewSessionRequest::new(cwd).mcp_servers(Vec::new())),
-                    )
-                    .await?;
-                    Ok(models_from_session_state(response.models.as_ref()))
-                })
-            },
-        )
+        run_on_acp_thread_with_process(process, |connection, _routing, _io_health| {
+            Box::pin(async move {
+                initialize_official_cli(&connection).await?;
+                let cwd =
+                    std::env::current_dir().context("Failed to determine working directory")?;
+                let response = timeout_acp_request(
+                    "session/new",
+                    connection
+                        .new_session(acp::NewSessionRequest::new(cwd).mcp_servers(Vec::new())),
+                )
+                .await?;
+                Ok(models_from_session_state(response.models.as_ref()))
+            })
+        })
         .await
     }
 
@@ -670,29 +664,34 @@ impl CopilotApiProvider {
 
     async fn complete_official(
         &self,
-        messages: &[ChatMessage],
         tools: &[ToolDefinition],
-        system: &str,
+        system_static: &str,
+        system_dynamic: &str,
         resume_session_id: Option<&str>,
         working_dir: PathBuf,
-        current_user_prompt: Option<&str>,
+        current_turn: Option<&ProviderTurnContext>,
     ) -> Result<EventStream> {
         self.wait_for_init().await;
         let CopilotBackend::OfficialCli { process } = &self.backend else {
             bail!("Copilot transport is not official-cli");
         };
         let resume_session_id = resume_session_id.map(parse_official_session_id);
-        let prompt = build_official_prompt(messages, system, resume_session_id.is_some())?;
-        let fresh_prompt = build_stale_fresh_prompt(messages, system, current_user_prompt)?;
+        let resumed = resume_session_id.is_some();
+        let prompt = build_official_prompt(system_static, system_dynamic, resumed, current_turn)?;
+        let fresh_prompt = if resumed {
+            build_stale_fresh_prompt(system_static, system_dynamic, current_turn)?
+        } else {
+            prompt.clone()
+        };
         let selected_model = self.model();
         let tool_policy = CopilotOfficialToolPolicy::from_jcode_tools(tools);
         let (tx, rx) = mpsc::channel(128);
-        let (cancel_tx, cancel_rx) = oneshot::channel();
         let config = OfficialRuntimeConfig {
             working_dir,
             tool_policy,
         };
-        let command_tx = {
+        let cancel = OfficialTurnCancellation::new();
+        let (lifecycle, generation) = {
             let mut runtime = self
                 .official_runtime
                 .lock()
@@ -706,25 +705,29 @@ impl CopilotApiProvider {
             if runtime.is_none() {
                 *runtime = Some(start_official_runtime(process.clone(), config.clone())?);
             }
-            runtime
-                .as_ref()
-                .map(|worker| worker.tx.clone())
-                .context("Official Copilot CLI runtime was unavailable")?
-        };
-        command_tx
-            .send(OfficialRuntimeCommand::Turn(OfficialTurnCommand {
+            let worker = runtime
+                .as_mut()
+                .context("Official Copilot CLI runtime was unavailable")?;
+            let generation = worker.next_generation();
+            worker.admit(OfficialTurnCommand {
+                generation,
                 selected_model,
                 resume_session_id,
                 prompt,
                 fresh_prompt,
                 tx,
-                cancel_rx,
-            }))
-            .map_err(|_| anyhow!("Official Copilot CLI runtime stopped before the turn started"))?;
+                cancel: cancel.clone(),
+            })?;
+            (worker.lifecycle.clone(), generation)
+        };
 
         Ok(Box::pin(CopilotOfficialEventStream {
             inner: ReceiverStream::new(rx),
-            cancel: Some(cancel_tx),
+            cancel: Some(OfficialStreamCancel {
+                turn: cancel,
+                lifecycle,
+                generation,
+            }),
         }))
     }
 
@@ -1254,22 +1257,39 @@ impl CopilotApiProvider {
 
 struct CopilotOfficialEventStream {
     inner: ReceiverStream<Result<StreamEvent>>,
-    cancel: Option<oneshot::Sender<()>>,
+    cancel: Option<OfficialStreamCancel>,
 }
 
 impl Stream for CopilotOfficialEventStream {
     type Item = Result<StreamEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        let result = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(result, Poll::Ready(None)) {
+            self.cancel = None;
+        }
+        result
     }
 }
 
 impl Drop for CopilotOfficialEventStream {
     fn drop(&mut self) {
         if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(());
+            cancel.request();
         }
+    }
+}
+
+struct OfficialStreamCancel {
+    turn: OfficialTurnCancellation,
+    lifecycle: OfficialRuntimeLifecycle,
+    generation: u64,
+}
+
+impl OfficialStreamCancel {
+    fn request(self) {
+        self.turn.request();
+        self.lifecycle.begin_cancelling_if_active(self.generation);
     }
 }
 
@@ -1280,12 +1300,13 @@ struct OfficialRuntimeConfig {
 }
 
 struct OfficialTurnCommand {
+    generation: u64,
     selected_model: String,
     resume_session_id: Option<String>,
     prompt: String,
     fresh_prompt: String,
     tx: mpsc::Sender<Result<StreamEvent>>,
-    cancel_rx: oneshot::Receiver<()>,
+    cancel: OfficialTurnCancellation,
 }
 
 enum OfficialRuntimeCommand {
@@ -1298,34 +1319,165 @@ struct OfficialRuntimeHandle {
     tx: mpsc::UnboundedSender<OfficialRuntimeCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
     io_closed: Arc<AtomicBool>,
-    shutdown: OfficialShutdown,
+    lifecycle: OfficialRuntimeLifecycle,
+    next_generation: u64,
 }
 
 impl OfficialRuntimeHandle {
     fn is_healthy(&self) -> bool {
-        !self.io_closed.load(Ordering::Acquire)
+        self.lifecycle.is_healthy()
+            && !self.io_closed.load(Ordering::Acquire)
             && !self
                 .thread
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
     }
+
+    fn next_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        generation
+    }
+
+    fn admit(&self, turn: OfficialTurnCommand) -> Result<()> {
+        let _admission = self
+            .lifecycle
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.is_healthy() {
+            return Err(official_runtime_retryable_error());
+        }
+        self.tx
+            .send(OfficialRuntimeCommand::Turn(turn))
+            .map_err(|_| official_runtime_retryable_error())
+    }
 }
 
 impl Drop for OfficialRuntimeHandle {
     fn drop(&mut self) {
-        self.shutdown.request();
+        self.lifecycle.begin_cancelling();
         let _ = self.tx.send(OfficialRuntimeCommand::Shutdown);
         self.thread.take();
     }
 }
 
+fn official_runtime_retryable_error() -> anyhow::Error {
+    anyhow!(
+        "Official Copilot CLI connection closed before the turn could complete; retry the request"
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum OfficialRuntimeState {
+    Healthy = 0,
+    Cancelling = 1,
+    Closed = 2,
+}
+
 #[derive(Clone)]
-struct OfficialShutdown {
+struct OfficialRuntimeLifecycle {
+    state: Arc<AtomicU8>,
+    notify: Arc<tokio::sync::Notify>,
+    admission: Arc<Mutex<()>>,
+    active_generation: Arc<AtomicU64>,
+}
+
+impl OfficialRuntimeLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(OfficialRuntimeState::Healthy as u8)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            admission: Arc::new(Mutex::new(())),
+            active_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn state(&self) -> OfficialRuntimeState {
+        match self.state.load(Ordering::Acquire) {
+            value if value == OfficialRuntimeState::Healthy as u8 => OfficialRuntimeState::Healthy,
+            value if value == OfficialRuntimeState::Cancelling as u8 => {
+                OfficialRuntimeState::Cancelling
+            }
+            _ => OfficialRuntimeState::Closed,
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.state() == OfficialRuntimeState::Healthy
+    }
+
+    fn begin_cancelling(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .state
+            .compare_exchange(
+                OfficialRuntimeState::Healthy as u8,
+                OfficialRuntimeState::Cancelling as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn begin_cancelling_if_active(&self, generation: u64) {
+        if self.active_generation.load(Ordering::Acquire) == generation {
+            self.begin_cancelling();
+        }
+    }
+
+    fn activate_generation(&self, generation: u64) {
+        self.active_generation.store(generation, Ordering::Release);
+    }
+
+    fn finish_generation(&self, generation: u64) {
+        let _ = self.active_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn close(&self) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.state.load(Ordering::Acquire) == OfficialRuntimeState::Healthy as u8 {
+            self.state
+                .store(OfficialRuntimeState::Cancelling as u8, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+        self.state
+            .store(OfficialRuntimeState::Closed as u8, Ordering::Release);
+        self.active_generation.store(0, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn not_healthy(&self) {
+        let notified = self.notify.notified();
+        if !self.is_healthy() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[derive(Clone)]
+struct OfficialTurnCancellation {
     requested: Arc<AtomicBool>,
     notify: Arc<tokio::sync::Notify>,
 }
 
-impl OfficialShutdown {
+impl OfficialTurnCancellation {
     fn new() -> Self {
         Self {
             requested: Arc::new(AtomicBool::new(false)),
@@ -1351,6 +1503,70 @@ impl OfficialShutdown {
     }
 }
 
+#[derive(Clone)]
+struct OfficialTurnRoute {
+    generation: u64,
+    tx: mpsc::Sender<Result<StreamEvent>>,
+    cancel: OfficialTurnCancellation,
+    forward_updates: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+struct OfficialTurnRouting {
+    active: Arc<Mutex<Option<OfficialTurnRoute>>>,
+}
+
+impl OfficialTurnRouting {
+    fn activate(&self, turn: &OfficialTurnCommand) -> OfficialTurnRoute {
+        let route = OfficialTurnRoute {
+            generation: turn.generation,
+            tx: turn.tx.clone(),
+            cancel: turn.cancel.clone(),
+            forward_updates: Arc::new(AtomicBool::new(false)),
+        };
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(route.clone());
+        route
+    }
+
+    fn current(&self) -> Option<OfficialTurnRoute> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|route| route.generation == generation)
+    }
+
+    fn deactivate(&self, generation: u64) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|route| route.generation == generation)
+        {
+            *active = None;
+        }
+    }
+
+    fn clear(&self) {
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
 #[derive(Default, Debug)]
 struct DiscoveredModels {
     current: Option<String>,
@@ -1370,90 +1586,85 @@ fn models_from_session_state(state: Option<&acp::SessionModelState>) -> Discover
     DiscoveredModels { current, available }
 }
 
-fn build_official_prompt(messages: &[ChatMessage], system: &str, resumed: bool) -> Result<String> {
-    if !resumed
-        && messages
-            .iter()
-            .any(|message| message.role == Role::Assistant)
-    {
-        bail!(
-            "Official Copilot CLI ACP cannot replay disconnected history; resume the provider session instead"
-        );
+fn effective_official_system(system_static: &str, system_dynamic: &str) -> String {
+    match (system_static.trim(), system_dynamic.trim()) {
+        ("", "") => String::new(),
+        (static_part, "") => static_part.to_string(),
+        ("", dynamic_part) => dynamic_part.to_string(),
+        (static_part, dynamic_part) => format!("{static_part}\n\n{dynamic_part}"),
     }
+}
 
-    let start = if resumed {
-        messages
-            .iter()
-            .rposition(|message| message.role == Role::Assistant)
-            .map_or(0, |index| index + 1)
-    } else {
-        0
-    };
-
+fn official_turn_sections(current_turn: Option<&ProviderTurnContext>) -> Result<Vec<String>> {
+    let current_turn = current_turn
+        .context("An explicit current user prompt is required for official Copilot CLI requests")?;
     let mut sections = Vec::new();
-    if !resumed && !system.trim().is_empty() {
-        sections.push(format!("<system>\n{}\n</system>", system.trim()));
-    }
-    for message in &messages[start..] {
-        if message.role != Role::User {
-            continue;
-        }
-        for block in &message.content {
-            match block {
-                ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                    sections.push(text.clone());
-                }
-                ContentBlock::ToolResult { content, .. } if !content.trim().is_empty() => {
-                    sections.push(content.clone());
-                }
-                ContentBlock::Image { .. } => {
-                    bail!("Image input is not supported by the official-cli ACP transport");
-                }
-                _ => {}
+    for block in &current_turn.user_content {
+        match block {
+            ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                sections.push(text.clone());
             }
+            ContentBlock::ToolResult { content, .. } if !content.trim().is_empty() => {
+                sections.push(content.clone());
+            }
+            ContentBlock::Image { .. } => {
+                bail!("Image input is not supported by the official-cli ACP transport");
+            }
+            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => {}
+            _ => bail!("Unsupported current user content for the official-cli ACP transport"),
         }
     }
     if sections.is_empty() {
-        bail!("No user prompt found for official Copilot CLI request");
+        bail!("An explicit current user prompt is required for official Copilot CLI requests");
+    }
+    Ok(sections)
+}
+
+fn build_official_prompt(
+    system_static: &str,
+    system_dynamic: &str,
+    resumed: bool,
+    current_turn: Option<&ProviderTurnContext>,
+) -> Result<String> {
+    let mut sections = Vec::new();
+    if !resumed {
+        let system = effective_official_system(system_static, system_dynamic);
+        if !system.is_empty() {
+            sections.push(format!("<system>\n{system}\n</system>"));
+        }
+    }
+    sections.extend(official_turn_sections(current_turn)?);
+    if resumed && !system_dynamic.trim().is_empty() {
+        sections.push(format!(
+            "<system-reminder>\n{}\n</system-reminder>",
+            system_dynamic.trim()
+        ));
+    }
+    if let Some(memory) = current_turn
+        .and_then(|current_turn| current_turn.memory_context.as_deref())
+        .filter(|memory| !memory.trim().is_empty())
+    {
+        sections.push(memory.to_string());
     }
     Ok(sections.join("\n\n"))
 }
 
 fn build_stale_fresh_prompt(
-    messages: &[ChatMessage],
-    system: &str,
-    current_user_prompt: Option<&str>,
+    system_static: &str,
+    system_dynamic: &str,
+    current_turn: Option<&ProviderTurnContext>,
 ) -> Result<String> {
     let mut sections = Vec::new();
-    if !system.trim().is_empty() {
-        sections.push(format!("<system>\n{}\n</system>", system.trim()));
+    let system = effective_official_system(system_static, system_dynamic);
+    if !system.is_empty() {
+        sections.push(format!("<system>\n{system}\n</system>"));
     }
-
-    if let Some(prompt) = current_user_prompt.filter(|prompt| !prompt.trim().is_empty()) {
-        sections.push(prompt.to_string());
-    } else {
-        let message = messages
-            .iter()
-            .rev()
-            .find(|message| message.role == Role::User)
-            .context("No current user prompt found for official Copilot CLI stale recovery")?;
-        for block in &message.content {
-            match block {
-                ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                    sections.push(text.clone());
-                }
-                ContentBlock::ToolResult { content, .. } if !content.trim().is_empty() => {
-                    sections.push(content.clone());
-                }
-                ContentBlock::Image { .. } => {
-                    bail!("Image input is not supported by the official-cli ACP transport");
-                }
-                _ => {}
-            }
-        }
-    }
-    if sections.is_empty() {
-        bail!("No current user prompt found for official Copilot CLI stale recovery");
+    sections.extend(official_turn_sections(current_turn)?);
+    if let Some(memory) = current_turn
+        .and_then(|current_turn| current_turn.memory_context.as_deref())
+        .filter(|memory| !memory.trim().is_empty())
+    {
+        sections.push(memory.to_string());
     }
     Ok(sections.join("\n\n"))
 }
@@ -1475,15 +1686,16 @@ fn start_official_runtime(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let io_closed = Arc::new(AtomicBool::new(false));
     let io_closed_notify = Arc::new(tokio::sync::Notify::new());
-    let shutdown = OfficialShutdown::new();
+    let lifecycle = OfficialRuntimeLifecycle::new();
     let thread = std::thread::Builder::new()
         .name("jcode-copilot-official-acp".to_string())
         .spawn({
             let config = config.clone();
             let io_closed = Arc::clone(&io_closed);
             let io_closed_notify = Arc::clone(&io_closed_notify);
-            let shutdown = shutdown.clone();
+            let lifecycle = lifecycle.clone();
             move || {
+                let lifecycle_for_close = lifecycle.clone();
                 let _ = run_official_runtime_thread(
                     process,
                     config,
@@ -1491,8 +1703,9 @@ fn start_official_runtime(
                     ready_tx,
                     io_closed,
                     io_closed_notify,
-                    shutdown,
+                    lifecycle,
                 );
+                lifecycle_for_close.close();
             }
         })
         .context("Failed to start official Copilot CLI ACP runtime thread")?;
@@ -1511,7 +1724,8 @@ fn start_official_runtime(
         tx,
         thread: Some(thread),
         io_closed,
-        shutdown,
+        lifecycle,
+        next_generation: 1,
     })
 }
 
@@ -1527,7 +1741,7 @@ fn run_official_runtime_thread(
     ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
     io_closed: Arc<AtomicBool>,
     io_closed_notify: Arc<tokio::sync::Notify>,
-    shutdown: OfficialShutdown,
+    lifecycle: OfficialRuntimeLifecycle,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1539,13 +1753,10 @@ fn run_official_runtime_thread(
             process,
             config.tool_policy,
             Some(config.working_dir.clone()),
-            mpsc::channel(1).0,
             io_closed,
             io_closed_notify,
-            async move |connection,
-                        forward_updates,
-                        shared_event_tx,
-                        io_health| {
+            lifecycle.clone(),
+            async move |connection, routing, io_health| {
                 let initialized = match initialize_official_cli(&connection).await {
                     Ok(initialized) => initialized,
                     Err(error) => {
@@ -1554,215 +1765,289 @@ fn run_official_runtime_thread(
                     }
                 };
                 let _ = ready.send(Ok(()));
-                let mut live_session: Option<LiveOfficialSession> = None;
-                loop {
-                    let io_closed = io_health.closed();
-                    let shutdown_requested = shutdown.requested();
-                    tokio::pin!(io_closed);
-                    tokio::pin!(shutdown_requested);
-                    if io_health.is_closed() || shutdown.is_requested() {
-                        return Ok(());
-                    }
-                    let command = tokio::select! {
-                        command = commands.recv() => command,
-                        _ = &mut io_closed => return Ok(()),
-                        _ = &mut shutdown_requested => return Ok(()),
-                    };
-                    let Some(command) = command else {
-                        return Ok(());
-                    };
-                    let OfficialRuntimeCommand::Turn(turn) = command else {
-                        return Ok(());
-                    };
-                    *shared_event_tx
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = turn.tx.clone();
-                    turn.tx
-                        .send(Ok(StreamEvent::ConnectionType {
-                            connection: format!("official-cli ACP ({})", turn.selected_model),
-                        }))
-                        .await
-                        .map_err(|_| anyhow!("Official Copilot CLI stream consumer closed"))?;
-
-                    let mut recovered_stale = false;
-                    if live_session.is_none() {
-                        match open_official_session(
-                            &connection,
-                            &initialized,
-                            &config.working_dir,
-                            turn.resume_session_id.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(session) => live_session = Some(session),
-                            Err(OpenOfficialSessionError::Stale) => recovered_stale = true,
-                            Err(OpenOfficialSessionError::Other(error)) => {
-                                let _ = turn.tx.send(Err(error)).await;
-                                *shared_event_tx
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                    mpsc::channel(1).0;
-                                return Ok(());
-                            }
+                let result: Result<()> = async {
+                    let mut live_session: Option<LiveOfficialSession> = None;
+                    loop {
+                        if !lifecycle.is_healthy() || io_health.is_closed() {
+                            return Ok(());
                         }
-                        if recovered_stale {
-                            recovered_stale = true;
-                            let response = match timeout_acp_request(
-                                "session/new",
-                                connection.new_session(
-                                    acp::NewSessionRequest::new(config.working_dir.clone())
-                                        .mcp_servers(Vec::new()),
+                        let command = tokio::select! {
+                            biased;
+                            _ = lifecycle.not_healthy() => return Ok(()),
+                            _ = io_health.closed() => return Ok(()),
+                            command = commands.recv() => command,
+                        };
+                        let Some(command) = command else {
+                            return Ok(());
+                        };
+                        let OfficialRuntimeCommand::Turn(turn) = command else {
+                            return Ok(());
+                        };
+                        if turn.cancel.is_requested() {
+                            continue;
+                        }
+                        if !lifecycle.is_healthy() {
+                            let _ = turn.tx.try_send(Err(official_runtime_retryable_error()));
+                            return Ok(());
+                        }
+                        lifecycle.activate_generation(turn.generation);
+                        let route = routing.activate(&turn);
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                            return Ok(());
+                        }
+                        turn.tx
+                            .send(Ok(StreamEvent::ConnectionType {
+                                connection: format!(
+                                    "official-cli ACP ({})",
+                                    turn.selected_model
                                 ),
+                            }))
+                            .await
+                            .map_err(|_| anyhow!("Official Copilot CLI stream consumer closed"))?;
+
+                        let mut recovered_stale = false;
+                        if live_session.is_none() {
+                            match open_official_session(
+                                &connection,
+                                &initialized,
+                                &config.working_dir,
+                                turn.resume_session_id.as_deref(),
+                                &turn.cancel,
+                                &lifecycle,
+                                &io_health,
                             )
                             .await
                             {
-                                Ok(response) => response,
-                                Err(error) => {
+                                Ok(session) => {
+                                    if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                                        return Ok(());
+                                    }
+                                    live_session = Some(session);
+                                }
+                                Err(OpenOfficialSessionError::Stale) => {
+                                    if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                                        return Ok(());
+                                    }
+                                    recovered_stale = true;
+                                }
+                                Err(OpenOfficialSessionError::Aborted) => return Ok(()),
+                                Err(OpenOfficialSessionError::Other(error)) => {
                                     let _ = turn.tx.send(Err(error)).await;
-                                    *shared_event_tx
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                        mpsc::channel(1).0;
                                     return Ok(());
                                 }
-                            };
-                            let new_session = LiveOfficialSession {
-                                id: response.session_id,
-                                models: response.models,
-                            };
-                            live_session = Some(new_session);
+                            }
+                            if recovered_stale {
+                                let request = connection.new_session(
+                                    acp::NewSessionRequest::new(config.working_dir.clone())
+                                        .mcp_servers(Vec::new()),
+                                );
+                                let response = match wait_for_turn_request(
+                                    "session/new",
+                                    ACP_REQUEST_TIMEOUT,
+                                    request,
+                                    &turn.cancel,
+                                    &lifecycle,
+                                    &io_health,
+                                )
+                                .await
+                                {
+                                    Ok(Ok(response)) => response,
+                                    Ok(Err(error)) => {
+                                        let _ = turn
+                                            .tx
+                                            .send(Err(anyhow!(
+                                                "Official Copilot CLI ACP session/new failed: {error}"
+                                            )))
+                                            .await;
+                                        return Ok(());
+                                    }
+                                    Err(TurnRequestWaitError::Aborted) => return Ok(()),
+                                    Err(TurnRequestWaitError::Other(error)) => {
+                                        let _ = turn.tx.send(Err(error)).await;
+                                        return Ok(());
+                                    }
+                                };
+                                if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                                    return Ok(());
+                                }
+                                live_session = Some(LiveOfficialSession {
+                                    id: response.session_id,
+                                    models: response.models,
+                                });
+                                if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                                    return Ok(());
+                                }
+                                turn.tx
+                                    .send(Ok(StreamEvent::StatusDetail {
+                                        detail:
+                                            "Prior upstream context unavailable; continued fresh"
+                                                .to_string(),
+                                    }))
+                                    .await
+                                    .ok();
+                            }
+                        }
+
+                        let session = live_session.as_mut().context(
+                            "Official Copilot CLI runtime did not have an active session",
+                        )?;
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                            return Ok(());
+                        }
+                        turn.tx
+                            .send(Ok(StreamEvent::SessionId(session.id.0.to_string())))
+                            .await
+                            .ok();
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                            return Ok(());
+                        }
+
+                        let current_model = session
+                            .models
+                            .as_ref()
+                            .map(|models| models.current_model_id.0.as_ref());
+                        if current_model != Some(turn.selected_model.as_str()) {
+                            let request = connection.set_session_model(
+                                acp::SetSessionModelRequest::new(
+                                    session.id.clone(),
+                                    turn.selected_model.clone(),
+                                ),
+                            );
+                            match wait_for_turn_request(
+                                "session/set_model",
+                                ACP_REQUEST_TIMEOUT,
+                                request,
+                                &turn.cancel,
+                                &lifecycle,
+                                &io_health,
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => {
+                                    let _ = turn
+                                        .tx
+                                        .send(Err(anyhow!(
+                                            "Official Copilot CLI ACP session/set_model failed: {error}"
+                                        )))
+                                        .await;
+                                    return Ok(());
+                                }
+                                Err(TurnRequestWaitError::Aborted) => return Ok(()),
+                                Err(TurnRequestWaitError::Other(error)) => {
+                                    let _ = turn.tx.send(Err(error)).await;
+                                    return Ok(());
+                                }
+                            }
+                            if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                                return Ok(());
+                            }
+                            if let Some(models) = session.models.as_mut() {
+                                models.current_model_id = turn.selected_model.clone().into();
+                            }
+                        }
+
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                            return Ok(());
+                        }
+                        route.forward_updates.store(true, Ordering::Release);
+                        let prompt = if recovered_stale {
+                            turn.fresh_prompt.clone()
+                        } else {
+                            turn.prompt.clone()
+                        };
+                        let content =
+                            vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))];
+                        let prompt_request =
+                            acp::PromptRequest::new(session.id.clone(), content);
+                        let prompt = connection.prompt(prompt_request);
+                        tokio::pin!(prompt);
+                        let prompt_timeout = tokio::time::sleep(ACP_PROMPT_TIMEOUT);
+                        tokio::pin!(prompt_timeout);
+                        let response_result = tokio::select! {
+                            biased;
+                            _ = turn.cancel.requested() => {
+                                lifecycle.begin_cancelling();
+                                route.forward_updates.store(false, Ordering::Release);
+                                routing.deactivate(turn.generation);
+                                let _ = tokio::time::timeout(
+                                    ACP_CANCEL_DRAIN_TIMEOUT,
+                                    connection.cancel(acp::CancelNotification::new(session.id.clone())),
+                                )
+                                .await;
+                                let _ = tokio::time::timeout(ACP_CANCEL_DRAIN_TIMEOUT, &mut prompt).await;
+                                return Ok(());
+                            }
+                            _ = lifecycle.not_healthy() => {
+                                route.forward_updates.store(false, Ordering::Release);
+                                routing.deactivate(turn.generation);
+                                return Ok(());
+                            }
+                            response = &mut prompt => response
+                                .map_err(|error| anyhow!("Official Copilot CLI ACP session/prompt failed: {error}")),
+                            _ = io_health.closed() => Err(official_runtime_retryable_error()),
+                            _ = &mut prompt_timeout => Err(anyhow!(
+                                "Official Copilot CLI ACP session/prompt timed out after {}s",
+                                ACP_PROMPT_TIMEOUT.as_secs()
+                            )),
+                        };
+                        let response = match response_result {
+                            Ok(response) => response,
+                            Err(error) => {
+                                route.forward_updates.store(false, Ordering::Release);
+                                routing.deactivate(turn.generation);
+                                let _ = turn
+                                    .tx
+                                    .send(Err(error.context(
+                                        "official Copilot CLI request failed",
+                                    )))
+                                    .await;
+                                return Ok(());
+                            }
+                        };
+
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                            return Ok(());
+                        }
+                        if let Some(usage) = response.usage {
                             turn.tx
-                                .send(Ok(StreamEvent::StatusDetail {
-                                    detail: "Prior upstream context unavailable; continued fresh"
-                                        .to_string(),
+                                .send(Ok(StreamEvent::TokenUsage {
+                                    input_tokens: Some(usage.input_tokens),
+                                    output_tokens: Some(usage.output_tokens),
+                                    cache_read_input_tokens: usage.cached_read_tokens,
+                                    cache_creation_input_tokens: usage.cached_write_tokens,
                                 }))
                                 .await
                                 .ok();
                         }
-                    }
-
-                    let session = live_session.as_mut().context(
-                        "Official Copilot CLI runtime did not have an active session",
-                    )?;
-                    turn.tx
-                        .send(Ok(StreamEvent::SessionId(session.id.0.to_string())))
-                        .await
-                        .ok();
-
-                    let current_model = session
-                        .models
-                        .as_ref()
-                        .map(|models| models.current_model_id.0.as_ref());
-                    if current_model != Some(turn.selected_model.as_str()) {
-                        if let Err(error) = timeout_acp_request(
-                            "session/set_model",
-                            connection.set_session_model(acp::SetSessionModelRequest::new(
-                                session.id.clone(),
-                                turn.selected_model.clone(),
-                            )),
-                        )
-                        .await
-                        {
-                            let _ = turn.tx.send(Err(error)).await;
-                            *shared_event_tx
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                mpsc::channel(1).0;
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
                             return Ok(());
                         }
-                        if let Some(models) = session.models.as_mut() {
-                            models.current_model_id = turn.selected_model.clone().into();
-                        }
-                    }
-
-                    forward_updates.store(true, Ordering::Release);
-                    let prompt = if recovered_stale {
-                        turn.fresh_prompt
-                    } else {
-                        turn.prompt
-                    };
-                    let content = vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))];
-                    let prompt_request = acp::PromptRequest::new(session.id.clone(), content);
-                    let mut cancel_rx = turn.cancel_rx;
-                    let prompt = connection.prompt(prompt_request);
-                    tokio::pin!(prompt);
-                    let prompt_timeout = tokio::time::sleep(ACP_PROMPT_TIMEOUT);
-                    let shutdown_requested = shutdown.requested();
-                    tokio::pin!(prompt_timeout);
-                    tokio::pin!(shutdown_requested);
-                    let response_result = tokio::select! {
-                        response = &mut prompt => response
-                            .map_err(|error| anyhow!("Official Copilot CLI ACP session/prompt failed: {error}")),
-                        _ = &mut prompt_timeout => Err(anyhow!(
-                            "Official Copilot CLI ACP session/prompt timed out after {}s",
-                            ACP_PROMPT_TIMEOUT.as_secs()
-                        )),
-                        _ = &mut cancel_rx => {
-                            forward_updates.store(false, Ordering::Release);
-                            *shared_event_tx
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                mpsc::channel(1).0;
-                            let _ = tokio::time::timeout(
-                                ACP_CANCEL_DRAIN_TIMEOUT,
-                                connection.cancel(acp::CancelNotification::new(session.id.clone())),
-                            )
-                            .await;
-                            let _ = tokio::time::timeout(ACP_CANCEL_DRAIN_TIMEOUT, &mut prompt).await;
-                            return Ok(());
-                        }
-                        _ = &mut shutdown_requested => {
-                            forward_updates.store(false, Ordering::Release);
-                            *shared_event_tx
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                mpsc::channel(1).0;
-                            return Ok(());
-                        }
-                    };
-                    let response = match response_result {
-                        Ok(response) => response,
-                        Err(error) => {
-                            let _ = turn
-                                .tx
-                                .send(Err(error.context(
-                                    "official Copilot CLI request failed",
-                                )))
-                                .await;
-                            *shared_event_tx
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                mpsc::channel(1).0;
-                            return Ok(());
-                        }
-                    };
-
-                    if let Some(usage) = response.usage {
                         turn.tx
-                            .send(Ok(StreamEvent::TokenUsage {
-                                input_tokens: Some(usage.input_tokens),
-                                output_tokens: Some(usage.output_tokens),
-                                cache_read_input_tokens: usage.cached_read_tokens,
-                                cache_creation_input_tokens: usage.cached_write_tokens,
+                            .send(Ok(StreamEvent::SessionId(session.id.0.to_string())))
+                            .await
+                            .ok();
+                        if !official_turn_can_commit(&turn, &lifecycle, &routing) {
+                            return Ok(());
+                        }
+                        route.forward_updates.store(false, Ordering::Release);
+                        routing.deactivate(turn.generation);
+                        lifecycle.finish_generation(turn.generation);
+                        turn.tx
+                            .send(Ok(StreamEvent::MessageEnd {
+                                stop_reason: Some(
+                                    acp_stop_reason(response.stop_reason).to_string(),
+                                ),
                             }))
                             .await
                             .ok();
                     }
-                    turn.tx
-                        .send(Ok(StreamEvent::SessionId(session.id.0.to_string())))
-                        .await
-                        .ok();
-                    turn.tx
-                        .send(Ok(StreamEvent::MessageEnd {
-                            stop_reason: Some(acp_stop_reason(response.stop_reason).to_string()),
-                        }))
-                        .await
-                        .ok();
-                    forward_updates.store(false, Ordering::Release);
-                    *shared_event_tx
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = mpsc::channel(1).0;
                 }
+                .await;
+                lifecycle.close();
+                routing.clear();
+                reject_pending_official_turns(&mut commands);
+                result
             },
         )
         .await
@@ -1771,7 +2056,62 @@ fn run_official_runtime_thread(
 
 enum OpenOfficialSessionError {
     Stale,
+    Aborted,
     Other(anyhow::Error),
+}
+
+enum TurnRequestWaitError {
+    Aborted,
+    Other(anyhow::Error),
+}
+
+async fn wait_for_turn_request<T>(
+    name: &'static str,
+    timeout_duration: Duration,
+    future: impl std::future::Future<Output = acp::Result<T>>,
+    cancel: &OfficialTurnCancellation,
+    lifecycle: &OfficialRuntimeLifecycle,
+    io_health: &OfficialIoHealth,
+) -> std::result::Result<acp::Result<T>, TurnRequestWaitError> {
+    tokio::pin!(future);
+    let timeout = tokio::time::sleep(timeout_duration);
+    tokio::pin!(timeout);
+    tokio::select! {
+        biased;
+        _ = cancel.requested() => {
+            lifecycle.begin_cancelling();
+            Err(TurnRequestWaitError::Aborted)
+        },
+        _ = lifecycle.not_healthy() => Err(TurnRequestWaitError::Aborted),
+        response = &mut future => Ok(response),
+        _ = io_health.closed() => Err(TurnRequestWaitError::Other(
+            official_runtime_retryable_error().context(format!("during {name}"))
+        )),
+        _ = &mut timeout => Err(TurnRequestWaitError::Other(anyhow!(
+            "Official Copilot CLI ACP {name} timed out after {}s",
+            timeout_duration.as_secs()
+        ))),
+    }
+}
+
+fn reject_pending_official_turns(commands: &mut mpsc::UnboundedReceiver<OfficialRuntimeCommand>) {
+    while let Ok(command) = commands.try_recv() {
+        if let OfficialRuntimeCommand::Turn(turn) = command {
+            let _ = turn.tx.try_send(Err(official_runtime_retryable_error()));
+        }
+    }
+}
+
+fn official_turn_can_commit(
+    turn: &OfficialTurnCommand,
+    lifecycle: &OfficialRuntimeLifecycle,
+    routing: &OfficialTurnRouting,
+) -> bool {
+    if turn.cancel.is_requested() {
+        lifecycle.begin_cancelling();
+        return false;
+    }
+    lifecycle.is_healthy() && routing.is_current(turn.generation)
 }
 
 async fn open_official_session(
@@ -1779,16 +2119,36 @@ async fn open_official_session(
     initialized: &acp::InitializeResponse,
     working_dir: &std::path::Path,
     resume_session_id: Option<&str>,
+    cancel: &OfficialTurnCancellation,
+    lifecycle: &OfficialRuntimeLifecycle,
+    io_health: &OfficialIoHealth,
 ) -> std::result::Result<LiveOfficialSession, OpenOfficialSessionError> {
     let Some(resume_session_id) = resume_session_id else {
-        let response = timeout_acp_request(
+        let response = wait_for_turn_request(
             "session/new",
+            ACP_REQUEST_TIMEOUT,
             connection.new_session(
                 acp::NewSessionRequest::new(working_dir.to_path_buf()).mcp_servers(Vec::new()),
             ),
+            cancel,
+            lifecycle,
+            io_health,
         )
-        .await
-        .map_err(OpenOfficialSessionError::Other)?;
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(OpenOfficialSessionError::Other(anyhow!(
+                    "Official Copilot CLI ACP session/new failed: {error}"
+                )));
+            }
+            Err(TurnRequestWaitError::Aborted) => {
+                return Err(OpenOfficialSessionError::Aborted);
+            }
+            Err(TurnRequestWaitError::Other(error)) => {
+                return Err(OpenOfficialSessionError::Other(error));
+            }
+        };
         return Ok(LiveOfficialSession {
             id: response.session_id,
             models: response.models,
@@ -1799,31 +2159,31 @@ async fn open_official_session(
             "Official Copilot CLI does not advertise ACP session/load support"
         )));
     }
-    let response = tokio::time::timeout(
+    let response = wait_for_turn_request(
+        "session/load",
         ACP_REQUEST_TIMEOUT,
         connection.load_session(
             acp::LoadSessionRequest::new(resume_session_id.to_string(), working_dir.to_path_buf())
                 .mcp_servers(Vec::new()),
         ),
+        cancel,
+        lifecycle,
+        io_health,
     )
-    .await
-    .map_err(|_| {
-        OpenOfficialSessionError::Other(anyhow!(
-            "Official Copilot CLI ACP session/load timed out after {}s",
-            ACP_REQUEST_TIMEOUT.as_secs()
-        ))
-    })?;
+    .await;
     match response {
-        Ok(response) => Ok(LiveOfficialSession {
+        Ok(Ok(response)) => Ok(LiveOfficialSession {
             id: acp::SessionId::new(resume_session_id.to_string()),
             models: response.models,
         }),
-        Err(error) if error.code == acp::ErrorCode::ResourceNotFound => {
+        Ok(Err(error)) if error.code == acp::ErrorCode::ResourceNotFound => {
             Err(OpenOfficialSessionError::Stale)
         }
-        Err(error) => Err(OpenOfficialSessionError::Other(anyhow!(
+        Ok(Err(error)) => Err(OpenOfficialSessionError::Other(anyhow!(
             "Official Copilot CLI ACP session/load failed: {error}"
         ))),
+        Err(TurnRequestWaitError::Aborted) => Err(OpenOfficialSessionError::Aborted),
+        Err(TurnRequestWaitError::Other(error)) => Err(OpenOfficialSessionError::Other(error)),
     }
 }
 
@@ -1872,7 +2232,6 @@ async fn timeout_acp_request<T>(
 }
 
 type LocalConnectionFuture<T> = Pin<Box<dyn std::future::Future<Output = Result<T>> + 'static>>;
-type SharedOfficialEventTx = Arc<Mutex<mpsc::Sender<Result<StreamEvent>>>>;
 
 #[derive(Clone)]
 struct OfficialIoHealth {
@@ -1914,8 +2273,7 @@ async fn run_on_acp_thread_with_process<T: Send + 'static>(
     process: CopilotOfficialCliProcess,
     operation: impl FnOnce(
         acp::ClientSideConnection,
-        Arc<AtomicBool>,
-        SharedOfficialEventTx,
+        OfficialTurnRouting,
         OfficialIoHealth,
     ) -> LocalConnectionFuture<T>
     + Send
@@ -1932,13 +2290,14 @@ async fn run_on_acp_thread_with_process<T: Send + 'static>(
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
                     let io_health = OfficialIoHealth::new();
+                    let lifecycle = OfficialRuntimeLifecycle::new();
                     with_official_connection(
                         process,
                         CopilotOfficialToolPolicy::default(),
                         None,
-                        mpsc::channel(1).0,
                         Arc::clone(&io_health.closed),
                         Arc::clone(&io_health.notify),
+                        lifecycle,
                         operation,
                     )
                     .await
@@ -1956,18 +2315,13 @@ async fn with_official_connection<T, F, Fut>(
     process: CopilotOfficialCliProcess,
     tool_policy: CopilotOfficialToolPolicy,
     working_dir: Option<PathBuf>,
-    event_tx: mpsc::Sender<Result<StreamEvent>>,
     io_closed: Arc<AtomicBool>,
     io_closed_notify: Arc<tokio::sync::Notify>,
+    lifecycle: OfficialRuntimeLifecycle,
     operation: F,
 ) -> Result<T>
 where
-    F: FnOnce(
-        acp::ClientSideConnection,
-        Arc<AtomicBool>,
-        SharedOfficialEventTx,
-        OfficialIoHealth,
-    ) -> Fut,
+    F: FnOnce(acp::ClientSideConnection, OfficialTurnRouting, OfficialIoHealth) -> Fut,
     Fut: std::future::Future<Output = Result<T>> + 'static,
 {
     let mut command = Command::new(&process.command);
@@ -2008,12 +2362,11 @@ where
     let mut stderr_task =
         tokio::task::spawn_local(capture_stderr(stderr, Arc::clone(&stderr_capture)));
 
-    let forward_updates = Arc::new(AtomicBool::new(false));
-    let shared_event_tx = Arc::new(Mutex::new(event_tx));
     let io_health = OfficialIoHealth::from_shared(io_closed, io_closed_notify);
+    let routing = OfficialTurnRouting::default();
     let client = CopilotAcpClient {
-        tx: Arc::clone(&shared_event_tx),
-        forward_updates: Arc::clone(&forward_updates),
+        routing: routing.clone(),
+        lifecycle,
         tool_policy,
     };
     let (connection, io) =
@@ -2028,7 +2381,7 @@ where
             result
         }
     });
-    let result = operation(connection, forward_updates, shared_event_tx, io_health).await;
+    let result = operation(connection, routing, io_health).await;
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     io_task.abort();
@@ -2071,8 +2424,8 @@ async fn capture_stderr(
 }
 
 struct CopilotAcpClient {
-    tx: SharedOfficialEventTx,
-    forward_updates: Arc<AtomicBool>,
+    routing: OfficialTurnRouting,
+    lifecycle: OfficialRuntimeLifecycle,
     tool_policy: CopilotOfficialToolPolicy,
 }
 
@@ -2082,6 +2435,19 @@ impl acp::Client for CopilotAcpClient {
         &self,
         request: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
+        let Some(route) = self.routing.current() else {
+            return Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            ));
+        };
+        if !self.lifecycle.is_healthy()
+            || route.cancel.is_requested()
+            || !self.routing.is_current(route.generation)
+        {
+            return Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            ));
+        }
         let selected = if self.tool_policy.allows(request.tool_call.fields.kind) {
             request
                 .options
@@ -2093,11 +2459,18 @@ impl acp::Client for CopilotAcpClient {
                 .iter()
                 .find(|option| option.kind == acp::PermissionOptionKind::RejectOnce)
         };
-        let outcome = match selected {
-            Some(option) => acp::RequestPermissionOutcome::Selected(
-                acp::SelectedPermissionOutcome::new(option.option_id.clone()),
-            ),
-            None => acp::RequestPermissionOutcome::Cancelled,
+        let outcome = if !self.lifecycle.is_healthy()
+            || route.cancel.is_requested()
+            || !self.routing.is_current(route.generation)
+        {
+            acp::RequestPermissionOutcome::Cancelled
+        } else {
+            match selected {
+                Some(option) => acp::RequestPermissionOutcome::Selected(
+                    acp::SelectedPermissionOutcome::new(option.option_id.clone()),
+                ),
+                None => acp::RequestPermissionOutcome::Cancelled,
+            }
         };
         Ok(acp::RequestPermissionResponse::new(outcome))
     }
@@ -2106,7 +2479,14 @@ impl acp::Client for CopilotAcpClient {
         &self,
         notification: acp::SessionNotification,
     ) -> acp::Result<()> {
-        if !self.forward_updates.load(Ordering::Acquire) {
+        let Some(route) = self.routing.current() else {
+            return Ok(());
+        };
+        if !self.lifecycle.is_healthy()
+            || route.cancel.is_requested()
+            || !route.forward_updates.load(Ordering::Acquire)
+            || !self.routing.is_current(route.generation)
+        {
             return Ok(());
         }
         let events: Vec<StreamEvent> = match notification.update {
@@ -2146,13 +2526,15 @@ impl acp::Client for CopilotAcpClient {
             }
             _ => Vec::new(),
         };
-        let tx = self
-            .tx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
         for event in events {
-            let _ = tx.send(Ok(event)).await;
+            if !self.lifecycle.is_healthy()
+                || route.cancel.is_requested()
+                || !route.forward_updates.load(Ordering::Acquire)
+                || !self.routing.is_current(route.generation)
+            {
+                break;
+            }
+            let _ = route.tx.send(Ok(event)).await;
         }
         Ok(())
     }
@@ -2219,14 +2601,7 @@ impl Provider for CopilotApiProvider {
             let working_dir =
                 std::env::current_dir().context("Failed to determine working directory")?;
             return self
-                .complete_official(
-                    messages,
-                    tools,
-                    system,
-                    resume_session_id,
-                    working_dir,
-                    None,
-                )
+                .complete_official(tools, system, "", resume_session_id, working_dir, None)
                 .await;
         }
 
@@ -2340,33 +2715,22 @@ impl Provider for CopilotApiProvider {
         resume_session_id: Option<&str>,
         request_context: &ProviderRequestContext,
     ) -> Result<EventStream> {
-        let dynamic_messages = messages_with_dynamic_system_context(messages, system_dynamic);
         if matches!(&self.backend, CopilotBackend::OfficialCli { .. }) {
             let working_dir = request_context.working_dir.clone().ok_or_else(|| {
                 anyhow!("Official Copilot CLI requests require a session working directory")
             })?;
-            let effective_system = match (system_static.trim(), system_dynamic.trim()) {
-                ("", "") => String::new(),
-                (static_part, "") => static_part.to_string(),
-                ("", dynamic_part) => dynamic_part.to_string(),
-                (static_part, dynamic_part) => format!("{static_part}\n\n{dynamic_part}"),
-            };
-            let official_messages = if resume_session_id.is_some() {
-                dynamic_messages.as_slice()
-            } else {
-                messages
-            };
             return self
                 .complete_official(
-                    official_messages,
                     tools,
-                    &effective_system,
+                    system_static,
+                    system_dynamic,
                     resume_session_id,
                     working_dir,
-                    request_context.current_user_prompt.as_deref(),
+                    request_context.current_turn.as_ref(),
                 )
                 .await;
         }
+        let dynamic_messages = messages_with_dynamic_system_context(messages, system_dynamic);
         self.complete(&dynamic_messages, tools, system_static, resume_session_id)
             .await
     }

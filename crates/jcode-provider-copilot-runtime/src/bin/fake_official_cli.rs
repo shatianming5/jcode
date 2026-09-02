@@ -35,6 +35,16 @@ fn response(id: Value, result: Value) {
     send(json!({"jsonrpc":"2.0", "id":id, "result":result}));
 }
 
+fn maybe_sleep_ms(name: &str) {
+    let Some(milliseconds) = std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+}
+
 fn main() {
     append_log(&json!({
         "process": {
@@ -71,6 +81,10 @@ fn main() {
                 }),
             ),
             "session/new" => {
+                maybe_sleep_ms("JCODE_FAKE_COPILOT_ACP_DELAY_NEW_MS");
+                if stale_load_seen {
+                    maybe_sleep_ms("JCODE_FAKE_COPILOT_ACP_DELAY_STALE_NEW_MS");
+                }
                 if stale_load_seen
                     && std::env::var_os("JCODE_FAKE_COPILOT_ACP_FAIL_STALE_NEW").is_some()
                 {
@@ -100,6 +114,7 @@ fn main() {
                 );
             }
             "session/load" => {
+                maybe_sleep_ms("JCODE_FAKE_COPILOT_ACP_DELAY_LOAD_MS");
                 let requested_session_id =
                     value["params"]["sessionId"].as_str().unwrap_or_default();
                 let configured_stale_id =
@@ -144,9 +159,13 @@ fn main() {
                     }),
                 );
             }
-            "session/set_model" => response(id, json!({})),
+            "session/set_model" => {
+                maybe_sleep_ms("JCODE_FAKE_COPILOT_ACP_DELAY_SET_MODEL_MS");
+                response(id, json!({}));
+            }
             "session/prompt" => {
                 let prompt_json = value["params"]["prompt"].to_string();
+                maybe_sleep_ms("JCODE_FAKE_COPILOT_ACP_DELAY_PROMPT_MS");
                 let hang_match = std::env::var("JCODE_FAKE_COPILOT_ACP_HANG_PROMPT_MATCH").ok();
                 if std::env::var_os("JCODE_FAKE_COPILOT_ACP_HANG").is_some()
                     || hang_match
@@ -162,7 +181,12 @@ fn main() {
                 {
                     return;
                 }
-                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_FAIL").is_some() {
+                let fail_match = std::env::var("JCODE_FAKE_COPILOT_ACP_FAIL_PROMPT_MATCH").ok();
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_FAIL").is_some()
+                    || fail_match
+                        .as_deref()
+                        .is_some_and(|needle| prompt_json.contains(needle))
+                {
                     eprintln!("official Copilot CLI request failed");
                     send(json!({
                         "jsonrpc":"2.0",
@@ -268,6 +292,39 @@ fn main() {
                 }
             }
             "session/cancel" => {
+                if std::env::var_os("JCODE_FAKE_COPILOT_ACP_LATE_PERMISSION_AFTER_CANCEL").is_some()
+                {
+                    send(json!({
+                        "jsonrpc":"2.0",
+                        "id":901,
+                        "method":"session/request_permission",
+                        "params":{
+                            "sessionId":"fake-copilot-session",
+                            "toolCall":{
+                                "toolCallId":"late-permission",
+                                "title":"Late cancelled permission",
+                                "kind":"read"
+                            },
+                            "options":[
+                                {"optionId":"reject", "name":"Reject once", "kind":"reject_once"},
+                                {"optionId":"once", "name":"Allow once", "kind":"allow_once"}
+                            ]
+                        }
+                    }));
+                    loop {
+                        let permission = lines
+                            .next()
+                            .expect("late permission response")
+                            .expect("read late permission response");
+                        let permission: Value = serde_json::from_str(&permission)
+                            .expect("valid late permission response");
+                        append_log(&permission);
+                        if permission["id"] == 901 && permission.get("method").is_none() {
+                            break;
+                        }
+                    }
+                }
+                maybe_sleep_ms("JCODE_FAKE_COPILOT_ACP_DELAY_CANCEL_MS");
                 if std::env::var_os("JCODE_FAKE_COPILOT_ACP_IGNORE_CANCEL").is_some() {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     continue;

@@ -546,11 +546,12 @@ impl Agent {
         }
     }
 
+    pub(super) fn memory_injection_context(memory: &crate::memory::PendingMemory) -> String {
+        format!("<system-reminder>\n{}\n</system-reminder>", memory.prompt)
+    }
+
     fn memory_injection_message(memory: &crate::memory::PendingMemory) -> Message {
-        Message::user(&format!(
-            "<system-reminder>\n{}\n</system-reminder>",
-            memory.prompt
-        ))
+        Message::user(&Self::memory_injection_context(memory))
     }
 
     pub(super) fn prepare_memory_injection_message(

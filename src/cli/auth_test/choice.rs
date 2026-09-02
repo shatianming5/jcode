@@ -274,10 +274,23 @@ async fn run_provider_smoke_for_choice(
         let provider = super::provider_init::init_provider_for_validation(choice, model)
             .await
             .with_context(|| format!("Failed to initialize {} provider", choice.as_arg_value()))?;
-        let output = provider
-            .complete_simple(prompt, "")
+        let working_dir =
+            std::env::current_dir().context("Failed to determine auth-test working directory")?;
+        let messages = [crate::message::Message::user(prompt)];
+        let request_context = crate::provider::ProviderRequestContext::new(Some(working_dir))
+            .with_current_turn(crate::provider::ProviderTurnContext::new(prompt));
+        let mut stream = provider
+            .complete_split_with_context(&messages, &[], "", "", None, &request_context)
             .await
             .with_context(|| format!("{} provider smoke prompt failed", choice.as_arg_value()))?;
+        let mut output = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(crate::message::StreamEvent::TextDelta(text)) => output.push_str(&text),
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(output.trim().to_string())
     })
     .await
@@ -334,8 +347,10 @@ async fn run_internal_provider_tool_smoke(
 ) -> Result<String> {
     let working_dir =
         std::env::current_dir().context("Failed to determine auth-test working directory")?;
-    let request_context =
-        crate::provider::ProviderRequestContext::new(Some(working_dir));
+    let request_context = crate::provider::ProviderRequestContext::new(Some(working_dir.clone()))
+        .with_current_turn(crate::provider::ProviderTurnContext::new(
+            DEFAULT_AUTH_TEST_INTERNAL_TOOL_PROMPT,
+        ));
     let tools = [crate::message::ToolDefinition {
         name: "read".to_string(),
         description: "Read a file without modifying it".to_string(),
@@ -353,6 +368,10 @@ async fn run_internal_provider_tool_smoke(
     let confirmation_messages = [crate::message::Message::user(
         DEFAULT_AUTH_TEST_PROVIDER_PROMPT,
     )];
+    let confirmation_context = crate::provider::ProviderRequestContext::new(Some(working_dir))
+        .with_current_turn(crate::provider::ProviderTurnContext::new(
+            DEFAULT_AUTH_TEST_PROVIDER_PROMPT,
+        ));
     let mut confirmation_stream = provider
         .complete_split_with_context(
             &confirmation_messages,
@@ -360,7 +379,7 @@ async fn run_internal_provider_tool_smoke(
             "",
             "",
             None,
-            &request_context,
+            &confirmation_context,
         )
         .await
         .context("Internal provider tool smoke marker confirmation failed to open a stream")?;

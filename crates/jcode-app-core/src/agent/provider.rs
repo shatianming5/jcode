@@ -1,28 +1,20 @@
 use super::*;
 
 impl Agent {
-    pub(super) fn current_user_prompt_for_provider(&self) -> Option<String> {
-        let message = self
-            .session
-            .messages
+    pub(super) fn provider_turn_context_since(
+        &self,
+        request_boundary: usize,
+    ) -> Option<crate::provider::ProviderTurnContext> {
+        // The boundary is captured immediately before one provider request.
+        // Only user blocks appended by that request's continuations are read;
+        // prior transcript history is never searched for a "latest" prompt.
+        let messages = self.session.messages.get(request_boundary..)?;
+        let content = messages
             .iter()
-            .rev()
-            .find(|message| message.role == crate::message::Role::User)?;
-        let mut parts = Vec::new();
-        for block in &message.content {
-            match block {
-                crate::message::ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                    parts.push(text.clone());
-                }
-                crate::message::ContentBlock::ToolResult { content, .. }
-                    if !content.trim().is_empty() =>
-                {
-                    parts.push(content.clone());
-                }
-                _ => {}
-            }
-        }
-        (!parts.is_empty()).then(|| parts.join("\n\n"))
+            .filter(|message| message.role == crate::message::Role::User)
+            .flat_map(|message| message.content.iter().cloned())
+            .collect::<Vec<_>>();
+        (!content.is_empty()).then(|| crate::provider::ProviderTurnContext::from_content(content))
     }
 
     pub(super) fn persist_provider_session_id(&mut self, session_id: String) -> Result<()> {

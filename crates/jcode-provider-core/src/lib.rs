@@ -77,22 +77,56 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 /// Providers that launch subprocesses must use this instead of process-global
 /// state such as `std::env::current_dir()`, because one long-lived server can
 /// serve multiple sessions rooted in different directories.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct ProviderRequestContext {
     pub working_dir: Option<PathBuf>,
-    pub current_user_prompt: Option<String>,
+    /// Caller-owned input for this request. Providers must not reconstruct it
+    /// from conversation history because failed turns can remain in history.
+    pub current_turn: Option<ProviderTurnContext>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderTurnContext {
+    /// Exact user/tool/image blocks admitted for this provider request.
+    pub user_content: Vec<ContentBlock>,
+    /// Optional memory recalled specifically for this turn.
+    pub memory_context: Option<String>,
+}
+
+impl ProviderTurnContext {
+    pub fn new(original_user_prompt: impl Into<String>) -> Self {
+        Self {
+            user_content: vec![ContentBlock::Text {
+                text: original_user_prompt.into(),
+                cache_control: None,
+            }],
+            memory_context: None,
+        }
+    }
+
+    pub fn from_content(user_content: Vec<ContentBlock>) -> Self {
+        Self {
+            user_content,
+            memory_context: None,
+        }
+    }
+
+    pub fn with_memory_context(mut self, memory_context: Option<String>) -> Self {
+        self.memory_context = memory_context;
+        self
+    }
 }
 
 impl ProviderRequestContext {
     pub fn new(working_dir: Option<PathBuf>) -> Self {
         Self {
             working_dir,
-            current_user_prompt: None,
+            current_turn: None,
         }
     }
 
-    pub fn with_current_user_prompt(mut self, prompt: Option<String>) -> Self {
-        self.current_user_prompt = prompt;
+    pub fn with_current_turn(mut self, current_turn: ProviderTurnContext) -> Self {
+        self.current_turn = Some(current_turn);
         self
     }
 }
@@ -533,7 +567,11 @@ pub trait Provider: Send + Sync {
             tool_duration_ms: None,
         }];
 
-        let response = self.complete(&messages, &[], system, None).await?;
+        let request_context = ProviderRequestContext::new(std::env::current_dir().ok())
+            .with_current_turn(ProviderTurnContext::new(prompt));
+        let response = self
+            .complete_split_with_context(&messages, &[], system, "", None, &request_context)
+            .await?;
         let mut result = String::new();
         tokio::pin!(response);
 

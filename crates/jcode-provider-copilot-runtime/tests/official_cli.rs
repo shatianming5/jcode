@@ -3,7 +3,7 @@ use jcode_app_core::{agent::Agent, session::Session, tool::Registry};
 use jcode_base::provider::{MultiProvider, external};
 use jcode_message_types::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
 use jcode_provider_copilot_runtime::{CopilotApiProvider, CopilotOfficialCliProcess};
-use jcode_provider_core::{Provider, ProviderRequestContext};
+use jcode_provider_core::{EventStream, Provider, ProviderRequestContext, ProviderTurnContext};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -32,6 +32,81 @@ fn named_tool(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: format!("{name} fixture"),
         input_schema: json!({"type":"object"}),
+    }
+}
+
+async fn start_official_turn(
+    provider: &dyn Provider,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    system: &str,
+    resume_session_id: Option<&str>,
+    current_prompt: &str,
+) -> anyhow::Result<EventStream> {
+    let request_context = ProviderRequestContext::new(Some(std::env::current_dir()?))
+        .with_current_turn(ProviderTurnContext::new(current_prompt));
+    provider
+        .complete_split_with_context(
+            messages,
+            tools,
+            system,
+            "",
+            resume_session_id,
+            &request_context,
+        )
+        .await
+}
+
+async fn wait_for_log_matches(log: &Path, needle: &str, expected: usize) -> String {
+    for _ in 0..200 {
+        let contents = std::fs::read_to_string(log).unwrap_or_default();
+        if contents.matches(needle).count() >= expected {
+            return contents;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let contents = std::fs::read_to_string(log).unwrap_or_default();
+    panic!("timed out waiting for {expected} occurrences of {needle:?} in {contents}");
+}
+
+#[cfg(unix)]
+fn latest_fake_child_pid(log: &Path) -> u32 {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value["process"]["pid"].as_u64())
+        .last()
+        .expect("fake child pid") as u32
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+async fn wait_for_process_exit(pid: u32, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if !process_is_running(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    !process_is_running(pid)
+}
+
+#[cfg(unix)]
+async fn stop_test_child(pid: u32) {
+    if process_is_running(pid) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _ = wait_for_process_exit(pid, 100).await;
     }
 }
 
@@ -84,15 +159,16 @@ async fn fake_official_cli_covers_command_env_handshake_stream_usage_and_permiss
     );
     provider.set_model("gpt-5-mini").unwrap();
 
-    let mut stream = provider
-        .complete(
-            &[Message::user("Reply exactly OK")],
-            &[one_tool()],
-            "outer-system",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Reply exactly OK")],
+        &[one_tool()],
+        "outer-system",
+        None,
+        "Reply exactly OK",
+    )
+    .await
+    .unwrap();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event.unwrap());
@@ -164,8 +240,10 @@ async fn resume_uses_session_load_without_replaying_or_flattening_history() {
     let provider = CopilotApiProvider::with_official_process(fake_process(&log));
     provider.complete_init_without_tier_detection();
 
+    let request_context = ProviderRequestContext::new(Some(temp.path().to_path_buf()))
+        .with_current_turn(ProviderTurnContext::new("new prompt"));
     let mut stream = provider
-        .complete(
+        .complete_split_with_context(
             &[
                 Message::user("old prompt"),
                 Message::assistant_text("old answer"),
@@ -173,7 +251,9 @@ async fn resume_uses_session_load_without_replaying_or_flattening_history() {
             ],
             &[one_tool()],
             "outer-system",
+            "",
             Some("existing-session"),
+            &request_context,
         )
         .await
         .unwrap();
@@ -193,28 +273,71 @@ async fn resume_uses_session_load_without_replaying_or_flattening_history() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn disconnected_history_is_rejected_instead_of_flattened() {
+async fn typed_current_context_does_not_flatten_disconnected_history() {
     let temp = tempfile::tempdir().unwrap();
     let provider =
         CopilotApiProvider::with_official_process(fake_process(&temp.path().join("history.jsonl")));
     provider.complete_init_without_tier_detection();
+    let mut stream = start_official_turn(
+        &provider,
+        &[
+            Message::user("old prompt"),
+            Message::assistant_text("old answer"),
+            Message::user("new prompt"),
+        ],
+        &[one_tool()],
+        "",
+        None,
+        "new prompt",
+    )
+    .await
+    .unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let requests = std::fs::read_to_string(temp.path().join("history.jsonl")).unwrap();
+    assert!(requests.contains("new prompt"), "{requests}");
+    assert!(!requests.contains("old prompt"), "{requests}");
+    assert!(!requests.contains("old answer"), "{requests}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn official_requests_reject_missing_typed_turn_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = CopilotApiProvider::with_official_process(fake_process(
+        &temp.path().join("missing-turn-context.jsonl"),
+    ));
+    provider.complete_init_without_tier_detection();
+
     let error = match provider
-        .complete(
-            &[
-                Message::user("old prompt"),
-                Message::assistant_text("old answer"),
-                Message::user("new prompt"),
-            ],
-            &[one_tool()],
-            "",
-            None,
-        )
+        .complete(&[Message::user("ambiguous input")], &[], "", None)
         .await
     {
-        Ok(_) => panic!("disconnected history should fail"),
+        Ok(_) => panic!("official request without typed current-turn context must fail"),
         Err(error) => error,
     };
-    assert!(format!("{error:#}").contains("cannot replay disconnected history"));
+    assert!(
+        format!("{error:#}").contains("explicit current user prompt is required"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn complete_simple_supplies_its_exact_prompt_as_typed_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("complete-simple.jsonl");
+    let provider = CopilotApiProvider::with_official_process(fake_process(&log));
+    provider.complete_init_without_tier_detection();
+
+    assert_eq!(
+        provider
+            .complete_simple("SIMPLE_EXACT_PROMPT", "")
+            .await
+            .unwrap(),
+        "OK"
+    );
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert_eq!(requests.matches("SIMPLE_EXACT_PROMPT").count(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -228,8 +351,17 @@ async fn official_failure_surfaces_stderr_without_native_fallback() {
     let provider = CopilotApiProvider::with_official_process(process.clone());
     provider.complete_init_without_tier_detection();
 
-    let error = provider.complete_simple("fail", "").await.unwrap_err();
-    let detail = format!("{error:#}");
+    let mut stream =
+        start_official_turn(&provider, &[Message::user("fail")], &[], "", None, "fail")
+            .await
+            .unwrap();
+    let mut detail = None;
+    while let Some(event) = stream.next().await {
+        if let Err(error) = event {
+            detail = Some(format!("{error:#}"));
+        }
+    }
+    let detail = detail.expect("official failure event");
     assert!(detail.contains("fake official-cli failure"), "{detail}");
     assert!(
         detail.contains("official Copilot CLI request failed"),
@@ -253,15 +385,16 @@ async fn ordinary_run_preserves_legitimate_info_prefixed_assistant_text() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
 
-    let mut stream = provider
-        .complete(
-            &[Message::user("Return the requested literal text")],
-            &[],
-            "",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Return the requested literal text")],
+        &[],
+        "",
+        None,
+        "Return the requested literal text",
+    )
+    .await
+    .unwrap();
     let mut output = String::new();
     while let Some(event) = stream.next().await {
         if let StreamEvent::TextDelta(text) = event.unwrap() {
@@ -283,10 +416,16 @@ async fn no_tool_profile_cancels_permission_requests() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
 
-    let mut stream = provider
-        .complete(&[Message::user("Reply exactly OK")], &[], "", None)
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Reply exactly OK")],
+        &[],
+        "",
+        None,
+        "Reply exactly OK",
+    )
+    .await
+    .unwrap();
     while stream.next().await.is_some() {}
 
     let requests = std::fs::read_to_string(log).unwrap();
@@ -311,15 +450,16 @@ async fn view_only_profile_rejects_execute_permission_by_kind() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
 
-    let mut stream = provider
-        .complete(
-            &[Message::user("Try a shell command")],
-            &[named_tool("view")],
-            "",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Try a shell command")],
+        &[named_tool("view")],
+        "",
+        None,
+        "Try a shell command",
+    )
+    .await
+    .unwrap();
     while stream.next().await.is_some() {}
 
     let requests = std::fs::read_to_string(log).unwrap();
@@ -348,15 +488,16 @@ async fn view_only_profile_rejects_write_permission_by_kind() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
 
-    let mut stream = provider
-        .complete(
-            &[Message::user("Try a write")],
-            &[named_tool("view")],
-            "",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Try a write")],
+        &[named_tool("view")],
+        "",
+        None,
+        "Try a write",
+    )
+    .await
+    .unwrap();
     while stream.next().await.is_some() {}
 
     let requests = std::fs::read_to_string(log).unwrap();
@@ -388,15 +529,16 @@ async fn unmapped_permission_kind_is_rejected_by_default() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
 
-    let mut stream = provider
-        .complete(
-            &[Message::user("Try an unknown tool")],
-            &[named_tool("view"), named_tool("bash"), named_tool("write")],
-            "",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Try an unknown tool")],
+        &[named_tool("view"), named_tool("bash"), named_tool("write")],
+        "",
+        None,
+        "Try an unknown tool",
+    )
+    .await
+    .unwrap();
     while stream.next().await.is_some() {}
 
     let requests = std::fs::read_to_string(log).unwrap();
@@ -422,10 +564,16 @@ async fn full_profile_keeps_read_available_and_selects_allow_once_by_option_kind
     provider.complete_init_without_tier_detection();
     let tools = [named_tool("view"), named_tool("bash"), named_tool("write")];
 
-    let mut stream = provider
-        .complete(&[Message::user("Read a file")], &tools, "", None)
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Read a file")],
+        &tools,
+        "",
+        None,
+        "Read a file",
+    )
+    .await
+    .unwrap();
     while stream.next().await.is_some() {}
 
     let requests = std::fs::read_to_string(log).unwrap();
@@ -447,19 +595,30 @@ async fn complete_in_dir(
     provider: &dyn Provider,
     working_dir: &Path,
     messages: &[Message],
+    current_user_prompt: &str,
     resume_session_id: Option<&str>,
 ) -> Vec<StreamEvent> {
-    complete_in_dir_with_system(provider, working_dir, messages, "", resume_session_id).await
+    complete_in_dir_with_system(
+        provider,
+        working_dir,
+        messages,
+        current_user_prompt,
+        "",
+        resume_session_id,
+    )
+    .await
 }
 
 async fn complete_in_dir_with_system(
     provider: &dyn Provider,
     working_dir: &Path,
     messages: &[Message],
+    current_user_prompt: &str,
     system: &str,
     resume_session_id: Option<&str>,
 ) -> Vec<StreamEvent> {
-    let request_context = ProviderRequestContext::new(Some(working_dir.to_path_buf()));
+    let request_context = ProviderRequestContext::new(Some(working_dir.to_path_buf()))
+        .with_current_turn(ProviderTurnContext::new(current_user_prompt));
     let mut stream = provider
         .complete_split_with_context(
             messages,
@@ -506,11 +665,18 @@ async fn request_context_sets_child_and_acp_cwd_without_cross_session_leakage() 
     let second_messages = [Message::user("second")];
 
     let (first, second) = tokio::join!(
-        complete_in_dir(first_provider.as_ref(), &first_dir, &first_messages, None),
+        complete_in_dir(
+            first_provider.as_ref(),
+            &first_dir,
+            &first_messages,
+            "first",
+            None
+        ),
         complete_in_dir(
             second_provider.as_ref(),
             &second_dir,
             &second_messages,
+            "second",
             None
         )
     );
@@ -554,6 +720,7 @@ async fn established_session_reuses_one_child_and_applies_model_switch() {
         &provider,
         &working_dir,
         &[Message::user("first turn")],
+        "first turn",
         None,
     )
     .await;
@@ -574,6 +741,7 @@ async fn established_session_reuses_one_child_and_applies_model_switch() {
             Message::assistant_text("OK"),
             Message::user("second turn"),
         ],
+        "second turn",
         Some(&session_id),
     )
     .await;
@@ -592,6 +760,7 @@ async fn established_session_reuses_one_child_and_applies_model_switch() {
             Message::assistant_text("OK"),
             Message::user("third turn"),
         ],
+        "third turn",
         Some(&session_id),
     )
     .await;
@@ -644,6 +813,7 @@ async fn stale_cross_process_session_load_recovers_once_with_replaced_session_id
         &provider,
         &working_dir,
         &[Message::user("first turn")],
+        "first turn",
         None,
     )
     .await;
@@ -669,6 +839,7 @@ async fn stale_cross_process_session_load_recovers_once_with_replaced_session_id
             Message::assistant_text("old assistant history"),
             Message::user("current prompt"),
         ],
+        "current prompt",
         "outer-system",
         Some(&stale_session_id),
     )
@@ -735,7 +906,7 @@ async fn stale_replacement_session_creation_failure_is_reported_to_the_turn() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
     let request_context = ProviderRequestContext::new(Some(working_dir))
-        .with_current_user_prompt(Some("current prompt".to_string()));
+        .with_current_turn(ProviderTurnContext::new("current prompt"));
     let mut stream = provider
         .complete_split_with_context(
             &[Message::user("current prompt")],
@@ -784,6 +955,7 @@ async fn child_death_between_turns_starts_fresh_without_failing_the_next_turn() 
         &provider,
         &working_dir,
         &[Message::user("first turn")],
+        "first turn",
         None,
     )
     .await;
@@ -805,6 +977,7 @@ async fn child_death_between_turns_starts_fresh_without_failing_the_next_turn() 
             Message::assistant_text("OK"),
             Message::user("current turn after child death"),
         ],
+        "current turn after child death",
         "CURRENT_SYSTEM",
         Some(&persisted),
     )
@@ -837,7 +1010,8 @@ async fn legacy_and_unmarked_stale_history_continue_current_prompt_without_repla
         .insert("JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND".into(), "1".into());
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
-    let request_context = ProviderRequestContext::new(Some(working_dir.clone()));
+    let request_context = ProviderRequestContext::new(Some(working_dir.clone()))
+        .with_current_turn(ProviderTurnContext::new("current prompt"));
     let messages = [
         Message::user("old instruction"),
         Message::assistant_text("old answer"),
@@ -922,7 +1096,7 @@ async fn stale_recovery_never_replays_side_effect_or_no_assistant_history() {
             })
             .unwrap();
         let request_context = ProviderRequestContext::new(Some(working_dir))
-            .with_current_user_prompt(Some(current.clone()));
+            .with_current_turn(ProviderTurnContext::new(current.clone()));
         let mut stream = provider
             .complete_split_with_context(
                 &messages,
@@ -1082,6 +1256,165 @@ async fn headless_agent_persists_stale_replacement_across_restarts() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn failed_prompt_is_not_replayed_into_the_next_agent_turn() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let saved_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("jcode-home");
+    let working_dir = temp.path().join("session");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    unsafe {
+        std::env::set_var("JCODE_HOME", &home);
+    }
+    let log = temp.path().join("failed-then-next.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND_ID".into(),
+        "fake-copilot-session".into(),
+    );
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_FAIL_PROMPT_MATCH".into(),
+        "FAILED_PROMPT_A".into(),
+    );
+    let mut session = Session::create_with_id("failed-then-next".to_string(), None, None);
+    session.working_dir = Some(working_dir.display().to_string());
+    session.save().unwrap();
+
+    let provider = Arc::new(CopilotApiProvider::with_official_process(process.clone()));
+    provider.complete_init_without_tier_detection();
+    let provider_dyn: Arc<dyn Provider> = provider;
+    let registry = Registry::new(Arc::clone(&provider_dyn)).await;
+    let mut agent = Agent::new_with_session(provider_dyn, registry, session, None);
+    assert_eq!(agent.run_once_capture("FIRST_OK").await.unwrap(), "OK");
+    let session_id = agent.session_id().to_string();
+    drop(agent);
+
+    let provider = Arc::new(CopilotApiProvider::with_official_process(process.clone()));
+    provider.complete_init_without_tier_detection();
+    let provider_dyn: Arc<dyn Provider> = provider;
+    let registry = Registry::new(Arc::clone(&provider_dyn)).await;
+    let persisted = Session::load(&session_id).unwrap();
+    let mut agent = Agent::new_with_session(provider_dyn, registry, persisted, None);
+    let error = agent.run_once_capture("FAILED_PROMPT_A").await.unwrap_err();
+    assert!(format!("{error:#}").contains("fake official-cli failure"));
+    drop(agent);
+
+    let provider = Arc::new(CopilotApiProvider::with_official_process(process));
+    provider.complete_init_without_tier_detection();
+    let provider_dyn: Arc<dyn Provider> = provider;
+    let registry = Registry::new(Arc::clone(&provider_dyn)).await;
+    let persisted = Session::load(&session_id).unwrap();
+    let mut agent = Agent::new_with_session(provider_dyn, registry, persisted, None);
+    assert_eq!(
+        agent.run_once_capture("CURRENT_PROMPT_B").await.unwrap(),
+        "OK"
+    );
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    let prompt_b = requests
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| {
+            value["method"] == "session/prompt" && value.to_string().contains("CURRENT_PROMPT_B")
+        })
+        .expect("prompt B request");
+    let prompt_b = prompt_b["params"]["prompt"][0]["text"].as_str().unwrap();
+    assert_eq!(prompt_b.matches("CURRENT_PROMPT_B").count(), 1);
+    assert!(!prompt_b.contains("FAILED_PROMPT_A"), "{prompt_b}");
+
+    unsafe {
+        match saved_home {
+            Some(value) => std::env::set_var("JCODE_HOME", value),
+            None => std::env::remove_var("JCODE_HOME"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_recovery_keeps_memory_additive_to_the_real_user_prompt() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let saved_home = std::env::var_os("JCODE_HOME");
+    let saved_persist = std::env::var_os("JCODE_PERSIST_MEMORY_INJECTIONS");
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("jcode-home");
+    let working_dir = temp.path().join("session");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    unsafe {
+        std::env::set_var("JCODE_HOME", &home);
+        std::env::set_var("JCODE_PERSIST_MEMORY_INJECTIONS", "true");
+    }
+    jcode_base::config::invalidate_config_cache();
+    jcode_base::memory::clear_all_pending_memory();
+    let log = temp.path().join("memory-stale.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND_ID".into(),
+        "fake-copilot-session".into(),
+    );
+    let mut session = Session::create_with_id("memory-stale".to_string(), None, None);
+    session.working_dir = Some(working_dir.display().to_string());
+    session.save().unwrap();
+
+    let provider = Arc::new(CopilotApiProvider::with_official_process(process.clone()));
+    provider.complete_init_without_tier_detection();
+    let provider_dyn: Arc<dyn Provider> = provider;
+    let registry = Registry::new(Arc::clone(&provider_dyn)).await;
+    let mut agent = Agent::new_with_session(provider_dyn, registry, session, None);
+    assert_eq!(
+        agent.run_once_capture("FIRST_MEMORY_TURN").await.unwrap(),
+        "OK"
+    );
+    let session_id = agent.session_id().to_string();
+    drop(agent);
+
+    let provider = Arc::new(CopilotApiProvider::with_official_process(process));
+    provider.complete_init_without_tier_detection();
+    let provider_dyn: Arc<dyn Provider> = provider;
+    let registry = Registry::new(Arc::clone(&provider_dyn)).await;
+    let persisted = Session::load(&session_id).unwrap();
+    let mut agent = Agent::new_with_session(provider_dyn, registry, persisted, None);
+    agent.set_memory_enabled(true);
+    jcode_base::memory::set_pending_memory_with_ids(
+        &session_id,
+        "MEMORY_ONLY_CONTEXT".to_string(),
+        1,
+        vec!["memory-review-fixture".to_string()],
+    );
+    assert_eq!(
+        agent
+            .run_once_capture("REAL_CURRENT_USER_PROMPT")
+            .await
+            .unwrap(),
+        "OK"
+    );
+
+    let requests = std::fs::read_to_string(log).unwrap();
+    let recovered = requests
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| {
+            value["method"] == "session/prompt" && value.to_string().contains("MEMORY_ONLY_CONTEXT")
+        })
+        .expect("memory-bearing recovered prompt");
+    let recovered = recovered["params"]["prompt"][0]["text"].as_str().unwrap();
+    assert_eq!(recovered.matches("REAL_CURRENT_USER_PROMPT").count(), 1);
+    assert_eq!(recovered.matches("MEMORY_ONLY_CONTEXT").count(), 1);
+
+    jcode_base::memory::clear_all_pending_memory();
+    unsafe {
+        match saved_persist {
+            Some(value) => std::env::set_var("JCODE_PERSIST_MEMORY_INJECTIONS", value),
+            None => std::env::remove_var("JCODE_PERSIST_MEMORY_INJECTIONS"),
+        }
+        match saved_home {
+            Some(value) => std::env::set_var("JCODE_HOME", value),
+            None => std::env::remove_var("JCODE_HOME"),
+        }
+    }
+    jcode_base::config::invalidate_config_cache();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn mid_turn_child_crash_errors_once_and_next_user_turn_starts_fresh() {
     let temp = tempfile::tempdir().unwrap();
     let working_dir = temp.path().join("session");
@@ -1103,6 +1436,7 @@ async fn mid_turn_child_crash_errors_once_and_next_user_turn_starts_fresh() {
         &provider,
         &working_dir,
         &[Message::user("FIRST_COMPLETED_PROMPT")],
+        "FIRST_COMPLETED_PROMPT",
         None,
     )
     .await;
@@ -1115,7 +1449,7 @@ async fn mid_turn_child_crash_errors_once_and_next_user_turn_starts_fresh() {
         .unwrap();
 
     let request_context = ProviderRequestContext::new(Some(working_dir.clone()))
-        .with_current_user_prompt(Some("CRASH_CURRENT_PROMPT".to_string()));
+        .with_current_turn(ProviderTurnContext::new("CRASH_CURRENT_PROMPT"));
     let mut crashed = provider
         .complete_split_with_context(
             &[
@@ -1153,6 +1487,7 @@ async fn mid_turn_child_crash_errors_once_and_next_user_turn_starts_fresh() {
             Message::user("CRASH_CURRENT_PROMPT"),
             Message::user("AFTER_CRASH_NEW_USER_TURN"),
         ],
+        "AFTER_CRASH_NEW_USER_TURN",
         "CURRENT_SYSTEM",
         Some(&persisted),
     )
@@ -1291,10 +1626,16 @@ async fn dropping_stream_cancels_prompt_and_terminates_official_cli() {
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
 
-    let mut stream = provider
-        .complete(&[Message::user("wait")], &[one_tool()], "", None)
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("wait")],
+        &[one_tool()],
+        "",
+        None,
+        "wait",
+    )
+    .await
+    .unwrap();
     let session = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
         .await
         .expect("session setup timed out")
@@ -1332,6 +1673,7 @@ async fn dropping_stream_cancels_prompt_and_terminates_official_cli() {
         &provider,
         temp.path(),
         &[Message::user("next turn")],
+        "next turn",
         Some(&session_id),
     )
     .await;
@@ -1353,6 +1695,274 @@ async fn dropping_stream_cancels_prompt_and_terminates_official_cli() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn turn_started_during_cancel_never_silently_enters_the_closing_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("cancel-admission.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_HANG_PROMPT_MATCH".into(),
+        "CANCEL_PROMPT_A".into(),
+    );
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_DELAY_CANCEL_MS".into(),
+        "500".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let mut first = start_official_turn(
+        &provider,
+        &[Message::user("CANCEL_PROMPT_A")],
+        &[one_tool()],
+        "",
+        None,
+        "CANCEL_PROMPT_A",
+    )
+    .await
+    .unwrap();
+    let _ = first.next().await.unwrap().unwrap();
+    let session_id = match first.next().await.unwrap().unwrap() {
+        StreamEvent::SessionId(id) => id,
+        event => panic!("expected session id, got {event:?}"),
+    };
+    drop(first);
+    wait_for_log_matches(&log, "\"method\":\"session/cancel\"", 1).await;
+
+    let request_context = ProviderRequestContext::new(Some(temp.path().to_path_buf()))
+        .with_current_turn(ProviderTurnContext::new("CURRENT_PROMPT_B"));
+    let second = provider
+        .complete_split_with_context(
+            &[
+                Message::user("CANCEL_PROMPT_A"),
+                Message::user("CURRENT_PROMPT_B"),
+            ],
+            &[one_tool()],
+            "",
+            "",
+            Some(&session_id),
+            &request_context,
+        )
+        .await;
+
+    let mut saw_success = false;
+    let mut retryable_error = None;
+    if let Ok(mut stream) = second {
+        while let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+                .await
+                .expect("second turn did not terminate")
+        {
+            match event {
+                Ok(StreamEvent::TextDelta(text)) if text == "OK" => saw_success = true,
+                Ok(_) => {}
+                Err(error) => retryable_error = Some(error.to_string()),
+            }
+        }
+    } else if let Err(error) = second {
+        retryable_error = Some(error.to_string());
+    }
+    assert!(
+        saw_success
+            || retryable_error
+                .as_deref()
+                .is_some_and(jcode_provider_core::is_transient_transport_error),
+        "turn B ended without success or an explicit retryable error: {retryable_error:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_a_queued_turn_does_not_cancel_the_active_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("queued-cancel.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_DELAY_PROMPT_MS".into(),
+        "500".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+    let first_context = ProviderRequestContext::new(Some(temp.path().to_path_buf()))
+        .with_current_turn(ProviderTurnContext::new("ACTIVE_PROMPT_A"));
+    let mut first = provider
+        .complete_split_with_context(
+            &[Message::user("ACTIVE_PROMPT_A")],
+            &[one_tool()],
+            "",
+            "",
+            None,
+            &first_context,
+        )
+        .await
+        .unwrap();
+    let _ = first.next().await.unwrap().unwrap();
+    let _ = first.next().await.unwrap().unwrap();
+    wait_for_log_matches(&log, "ACTIVE_PROMPT_A", 1).await;
+
+    let second_context = ProviderRequestContext::new(Some(temp.path().to_path_buf()))
+        .with_current_turn(ProviderTurnContext::new("QUEUED_PROMPT_B"));
+    let second = provider
+        .complete_split_with_context(
+            &[Message::user("QUEUED_PROMPT_B")],
+            &[one_tool()],
+            "",
+            "",
+            None,
+            &second_context,
+        )
+        .await
+        .unwrap();
+    drop(second);
+
+    let mut text = String::new();
+    let mut ended = false;
+    while let Some(event) = first.next().await {
+        match event.unwrap() {
+            StreamEvent::TextDelta(delta) => text.push_str(&delta),
+            StreamEvent::MessageEnd { .. } => ended = true,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "OK");
+    assert!(ended, "active turn ended without MessageEnd");
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert!(!requests.contains("QUEUED_PROMPT_B"), "{requests}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_generation_rejects_a_late_permission_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("late-permission.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_HANG_PROMPT_MATCH".into(),
+        "CANCEL_FOR_PERMISSION".into(),
+    );
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_LATE_PERMISSION_AFTER_CANCEL".into(),
+        "1".into(),
+    );
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("CANCEL_FOR_PERMISSION")],
+        &[one_tool()],
+        "",
+        None,
+        "CANCEL_FOR_PERMISSION",
+    )
+    .await
+    .unwrap();
+    let _ = stream.next().await.unwrap().unwrap();
+    let _ = stream.next().await.unwrap().unwrap();
+    drop(stream);
+
+    let requests = wait_for_log_matches(&log, "\"id\":901", 1).await;
+    let response = requests
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["id"] == 901)
+        .expect("late permission response");
+    assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_during_each_setup_request_stops_the_exact_child_promptly() {
+    #[derive(Clone, Copy)]
+    enum SetupCase {
+        New,
+        Load,
+        ReplacementNew,
+        SetModel,
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut failures = Vec::new();
+    for (name, case) in [
+        ("new", SetupCase::New),
+        ("load", SetupCase::Load),
+        ("replacement-new", SetupCase::ReplacementNew),
+        ("set-model", SetupCase::SetModel),
+    ] {
+        let working_dir = temp.path().join(name);
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let log = temp.path().join(format!("{name}.jsonl"));
+        let mut process = fake_process(&log);
+        let resume = match case {
+            SetupCase::New => {
+                process
+                    .env
+                    .insert("JCODE_FAKE_COPILOT_ACP_DELAY_NEW_MS".into(), "1000".into());
+                None
+            }
+            SetupCase::Load => {
+                process
+                    .env
+                    .insert("JCODE_FAKE_COPILOT_ACP_DELAY_LOAD_MS".into(), "1000".into());
+                Some("existing-session")
+            }
+            SetupCase::ReplacementNew => {
+                process.env.insert(
+                    "JCODE_FAKE_COPILOT_ACP_LOAD_NOT_FOUND_ID".into(),
+                    "stale-session".into(),
+                );
+                process.env.insert(
+                    "JCODE_FAKE_COPILOT_ACP_DELAY_STALE_NEW_MS".into(),
+                    "1000".into(),
+                );
+                Some("stale-session")
+            }
+            SetupCase::SetModel => {
+                process.env.insert(
+                    "JCODE_FAKE_COPILOT_ACP_DELAY_SET_MODEL_MS".into(),
+                    "1000".into(),
+                );
+                None
+            }
+        };
+        let provider = CopilotApiProvider::with_official_process(process);
+        provider.complete_init_without_tier_detection();
+        if matches!(case, SetupCase::SetModel) {
+            provider.set_model("gpt-5-mini").unwrap();
+        }
+        let prompt = format!("cancel during {name}");
+        let request_context = ProviderRequestContext::new(Some(working_dir))
+            .with_current_turn(ProviderTurnContext::new(prompt.clone()));
+        let stream = provider
+            .complete_split_with_context(
+                &[Message::user(&prompt)],
+                &[one_tool()],
+                "",
+                "",
+                resume,
+                &request_context,
+            )
+            .await
+            .unwrap();
+        let (method, count) = match case {
+            SetupCase::New => ("\"method\":\"session/new\"", 1),
+            SetupCase::Load => ("\"method\":\"session/load\"", 1),
+            SetupCase::ReplacementNew => ("\"method\":\"session/new\"", 1),
+            SetupCase::SetModel => ("\"method\":\"session/set_model\"", 1),
+        };
+        wait_for_log_matches(&log, method, count).await;
+        let pid = latest_fake_child_pid(&log);
+        drop(stream);
+        let exited = wait_for_process_exit(pid, 40).await;
+        if !exited {
+            failures.push(name);
+            stop_test_child(pid).await;
+        }
+        drop(provider);
+    }
+    assert!(
+        failures.is_empty(),
+        "setup cancellation left children running: {failures:?}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_provider_terminates_a_hung_official_cli_child() {
@@ -1364,15 +1974,16 @@ async fn dropping_provider_terminates_a_hung_official_cli_child() {
         .insert("JCODE_FAKE_COPILOT_ACP_HANG".into(), "1".into());
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
-    let mut stream = provider
-        .complete(
-            &[Message::user("hang until provider drop")],
-            &[one_tool()],
-            "",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("hang until provider drop")],
+        &[one_tool()],
+        "",
+        None,
+        "hang until provider drop",
+    )
+    .await
+    .unwrap();
     for _ in 0..2 {
         tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -1419,15 +2030,16 @@ async fn cancel_terminates_a_child_that_ignores_the_notification() {
         .insert("JCODE_FAKE_COPILOT_ACP_IGNORE_CANCEL".into(), "1".into());
     let provider = CopilotApiProvider::with_official_process(process);
     provider.complete_init_without_tier_detection();
-    let mut stream = provider
-        .complete(
-            &[Message::user("hang until cancel")],
-            &[one_tool()],
-            "",
-            None,
-        )
-        .await
-        .unwrap();
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("hang until cancel")],
+        &[one_tool()],
+        "",
+        None,
+        "hang until cancel",
+    )
+    .await
+    .unwrap();
     for _ in 0..2 {
         tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
