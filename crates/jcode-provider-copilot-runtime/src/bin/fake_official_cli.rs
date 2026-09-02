@@ -224,6 +224,19 @@ fn main() {
                         &serde_json::from_str(&permission).expect("valid permission response"),
                     );
                 }
+                if let Ok(notice) = std::env::var("JCODE_FAKE_COPILOT_ACP_CONFIG_NOTICE") {
+                    send(json!({
+                        "jsonrpc":"2.0",
+                        "method":"session/update",
+                        "params":{
+                            "sessionId":"fake-copilot-session",
+                            "update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text", "text":notice}
+                            }
+                        }
+                    }));
+                }
                 send(json!({
                     "jsonrpc":"2.0",
                     "method":"session/update",

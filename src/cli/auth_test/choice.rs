@@ -451,30 +451,7 @@ impl AuthTestTextCleaner {
 }
 
 fn is_exact_auth_test_configuration_line(line: &str) -> bool {
-    if let Some(tools) = line.strip_prefix("Info: Disabled tools: ") {
-        let tools = tools.split(", ").collect::<Vec<_>>();
-        return !tools.is_empty()
-            && tools.iter().all(|tool| {
-                !tool.is_empty()
-                    && tool
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character))
-            })
-            && (tools.len() > 1
-                || matches!(
-                    tools[0],
-                    "bash" | "create" | "edit" | "glob" | "grep" | "view" | "web_fetch"
-                ));
-    }
-    for prefix in [
-        "Info: Unknown tool name in the tool allowlist: \"",
-        "Info: Unknown tool name in the tool excludedlist: \"",
-    ] {
-        if let Some(name) = line.strip_prefix(prefix).and_then(|line| line.strip_suffix('"')) {
-            return !name.is_empty() && !name.contains('"');
-        }
-    }
-    false
+    jcode_provider_copilot_runtime::is_official_cli_configuration_notice(line)
 }
 
 #[cfg(test)]

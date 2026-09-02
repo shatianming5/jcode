@@ -406,6 +406,41 @@ async fn ordinary_run_preserves_legitimate_info_prefixed_assistant_text() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn ordinary_run_filters_an_exact_official_configuration_notification_chunk() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("configuration-notice.jsonl");
+    let mut process = fake_process(&log);
+    process.env.insert(
+        "JCODE_FAKE_COPILOT_ACP_CONFIG_NOTICE".into(),
+        "Info: Disabled tools: bash, edit".into(),
+    );
+    process
+        .env
+        .insert("JCODE_FAKE_COPILOT_ACP_REPLY".into(), "STARTUP_OK".into());
+    let provider = CopilotApiProvider::with_official_process(process);
+    provider.complete_init_without_tier_detection();
+
+    let mut stream = start_official_turn(
+        &provider,
+        &[Message::user("Reply exactly STARTUP_OK")],
+        &[],
+        "",
+        None,
+        "Reply exactly STARTUP_OK",
+    )
+    .await
+    .unwrap();
+    let mut output = String::new();
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::TextDelta(text) = event.unwrap() {
+            output.push_str(&text);
+        }
+    }
+
+    assert_eq!(output, "STARTUP_OK");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn no_tool_profile_cancels_permission_requests() {
     let temp = tempfile::tempdir().unwrap();
     let log = temp.path().join("permission-cancel.jsonl");

@@ -30,6 +30,9 @@
   generation checks. A ready ACP response wins over simultaneous child EOF;
   cancellation still has priority and late events/permissions cannot cross
   generations.
+- Exact official CLI configuration-notice chunks are removed at the ACP event
+  boundary before normal assistant output. Same-chunk response text and
+  legitimate `Info:`-prefixed assistant content remain unchanged.
 - Existing cwd isolation, permission allowlist, internal-tool auth-test,
   official auth ownership, model-switch, and fork isolation behavior remains.
 
@@ -44,7 +47,7 @@
   on-disk ID still `fake-copilot-session` instead of
   `recovered-copilot-session`; restoring the save path made it pass.
 - `cargo test -p jcode-provider-copilot-runtime --lib` passes 44 tests.
-- `cargo test -p jcode-provider-copilot-runtime --test official_cli` passes 32
+- `cargo test -p jcode-provider-copilot-runtime --test official_cli` passes 33
   integration tests.
 - `cargo test -p jcode-app-core --no-default-features provider_session_tests`
   passes 3 tests.
@@ -68,17 +71,26 @@
 - Final external review passed after targeted red/green coverage for exact
   per-request soft-interrupt text/images, queued-turn cancellation, post-await
   commit fencing, missing-context rejection, and response-before-EOF ordering.
-- Repository-prescribed `jcode self-dev --build` completed its build and
-  published immutable version `4a4979372-dirty-a8755071dafd` using the existing
+- A post-install fresh-shell reproduction returned exit 0 but text
+  `Info: Disabled tools: …STARTUP_OK`. Launcher/resolved-binary,
+  isolated/shared-socket, raw-wrapper, and daemon-version comparisons all
+  reproduced or ruled out host routing, isolating the exact ACP configuration
+  notification as the root cause. The narrow regression failed with
+  `Info: Disabled tools: bash, editSTARTUP_OK` before the event-boundary filter
+  and passes with exact `STARTUP_OK` afterward; the legitimate Info-prefix test
+  also remains green.
+- External rereview of the startup fix passed. Repository-prescribed
+  `jcode self-dev --build` then published immutable version
+  `76085fbd1-dirty-1750358f14d5` using the existing
   Rust 1.94.1 toolchain. `current`, `shared-server`, and the launcher resolve to
   that binary; forced server reload reported `handoff_ready=true`. The installed
-  binary reports `jcode v0.81.23-dev (4a4979372, dirty)`.
-- Serial fresh-login-shell smoke against raw `/opt/homebrew/bin/copilot` and the
-  installed launcher passes: official auth-test returns `AUTH_TEST_OK` for both
-  provider and read-only tool smoke, ordinary text returns `ACP_TEXT_OK`, and
-  two fresh-process restores return `ACP_RESTART_OK` and `ACP_REOPEN_OK` for
-  local session `session_hare_1788313019872_0efe92da4b2f927e`. No ACP child or
-  orphan process remains.
+  binary reports `jcode v0.81.24-dev (76085fbd1, dirty)`.
+- Final fresh-login-shell probes through the normal launcher return exact
+  `STARTUP_OK` for no socket, an isolated socket, and the shared socket, with no
+  configuration prefix. Installed ACP turns return `ACP_TEXT_OK`,
+  `ACP_RESTART_OK`, and `ACP_REOPEN_OK` for local session
+  `session_ladybug_1788317932883_80e964cf1b885013`; no ACP child or orphan
+  remains.
 - GitHub Copilot CLI 1.0.83-1 successfully loaded the real upstream session
   across these process restarts, so the real smoke did not naturally enter the
   typed `ResourceNotFound` branch; deterministic fake-ACP coverage exercises
@@ -89,4 +101,5 @@
 
 ## Next
 
-- Push the reviewed branch and await upstream pull-request review.
+- Push the reviewed startup fix to the existing branch. No pull request is
+  requested for this delivery.

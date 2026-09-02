@@ -2491,6 +2491,7 @@ impl acp::Client for CopilotAcpClient {
         }
         let events: Vec<StreamEvent> = match notification.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => text_from_acp_content(chunk.content)
+                .filter(|text| !is_official_cli_configuration_notice(text))
                 .map(StreamEvent::TextDelta)
                 .into_iter()
                 .collect(),
@@ -2538,6 +2539,43 @@ impl acp::Client for CopilotAcpClient {
         }
         Ok(())
     }
+}
+
+pub fn is_official_cli_configuration_notice(text: &str) -> bool {
+    let line = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    if line.contains(['\r', '\n']) {
+        return false;
+    }
+    if let Some(tools) = line.strip_prefix("Info: Disabled tools: ") {
+        let tools = tools.split(", ").collect::<Vec<_>>();
+        return !tools.is_empty()
+            && tools.iter().all(|tool| {
+                !tool.is_empty()
+                    && tool.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "_-.".contains(character)
+                    })
+            })
+            && (tools.len() > 1
+                || matches!(
+                    tools[0],
+                    "bash" | "create" | "edit" | "glob" | "grep" | "view" | "web_fetch"
+                ));
+    }
+    for prefix in [
+        "Info: Unknown tool name in the tool allowlist: \"",
+        "Info: Unknown tool name in the tool excludedlist: \"",
+    ] {
+        if let Some(name) = line
+            .strip_prefix(prefix)
+            .and_then(|line| line.strip_suffix('"'))
+        {
+            return !name.is_empty() && !name.contains('"');
+        }
+    }
+    false
 }
 
 fn provider_tool_kind(kind: acp::ToolKind) -> ProviderToolKind {
